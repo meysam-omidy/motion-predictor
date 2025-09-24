@@ -53,7 +53,8 @@ class LSTM(nn.Module):
         outputs = torch.zeros_like(x)
         last_output = x[:, 0, :].unsqueeze(1)
         for t in range(x.shape[1]):
-            mask = torch.rand_like(x[:, t, :].unsqueeze(1), dtype=torch.float).to(x.device)
+            mask = torch.rand(x.shape[0],1,1).repeat(1,1,self.input_size).to(x.device)
+            # mask = torch.rand_like(x[:, t, :].unsqueeze(1), dtype=torch.float).to(x.device)
             input_tensor = torch.where(mask < teacher_ratio, x[:, t, :].unsqueeze(1), last_output)
             o, (h,c) = self.forward(input_tensor, h, c)
             # o, (h, c) = self.lstm(input_tensor, (h, c))
