@@ -1,105 +1,115 @@
 import torch
-from torch import nn
-from copy import copy
+import torch.nn as nn
+import torch.optim as optim
+import random
 
-class LSTM(nn.Module):
-    def __init__(self, input_size, middle_size, hidden_size, num_layers, dropout=0.1):
-        super().__init__()
-        self.input_size = input_size
-        self.middle_size = middle_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.dropout = dropout
-        self.fc_in = nn.Sequential(
-            nn.Linear(input_size, middle_size),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(middle_size, middle_size),
-            nn.LeakyReLU(),
-            # nn.Dropout(dropout),
-            # nn.Linear(middle_size, hidden_size),
-            # nn.LeakyReLU()
-        )
-        self.lstm = nn.LSTM(middle_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc_out = nn.Sequential(
-            nn.Linear(hidden_size, middle_size),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(middle_size, middle_size),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(middle_size, input_size),
-            nn.Sigmoid(),
-        )
-        # self.fc = nn.Linear(hidden_size, input_size)
+# ----------------------------
+# LSTM Seq2Seq for Bounding Box Prediction
 
-    def forward(self, x, input_h=None, input_c=None):
-        if input_h == None:
-            h = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        else:
-            h = input_h
-        if input_c == None:
-            c = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        else:
-            c = input_c
-        o = self.fc_in(x)
-        o, (h, c) = self.lstm(o, (h, c))
-        o = self.fc_out(o)
-        return o * 2 - 1, (h, c)
+# ----------------------------
 
-    def sequential_forward(self, x, teacher_ratio):
-        h = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        c = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        outputs = torch.zeros_like(x)
-        last_output = x[:, 0, :].unsqueeze(1)
-        for t in range(x.shape[1]):
-            mask = torch.rand(x.shape[0],1,1).repeat(1,1,self.input_size).to(x.device)
-            # mask = torch.rand_like(x[:, t, :].unsqueeze(1), dtype=torch.float).to(x.device)
-            input_tensor = torch.where(mask < teacher_ratio, x[:, t, :].unsqueeze(1), last_output)
-            o, (h,c) = self.forward(input_tensor, h, c)
-            # o, (h, c) = self.lstm(input_tensor, (h, c))
-            # o = self.fc(o)
-            outputs[:, t, :] = o.squeeze()
-            last_output = o
-        return outputs * 2 - 1
+class LSTMPredictor(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=64, num_layers=2, dropout=0.2):
+        super(LSTMPredictor, self).__init__()
 
-    def sequentia_inference(self, x, input_h=None, input_c=None, num_steps=1):
-        if input_h == None:
-            h = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        else:
-            h = input_h
-        if input_c == None:
-            c = torch.zeros(self.num_layers, x.shape[0], self.hidden_size).type(torch.float).to(x.device)
-        else:
-            c = input_c
-        outputs = torch.zeros(size=(x.shape[0], num_steps, self.input_size)).to(x.device)
-        last_output = x[:, 0, :].unsqueeze(1)
-        for t in range(num_steps):
-            # mask = torch.rand_like(x[:, t, :].unsqueeze(1), dtype=torch.float).to(x.device)
-            # input_tensor = torch.where(mask < teacher_ratio, x[:, t, :].unsqueeze(1), last_output)
-            o, (h,c) = self.forward(last_output, h, c)
-            # o, (h, c) = self.lstm(input_tensor, (h, c))
-            # o = self.fc(o)
-            outputs[:, t, :] = o.squeeze()
-            last_output = o
-        return outputs * 2 - 1
+        self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, dtype=torch.float64)
+        self.decoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, dtype=torch.float64)
+        self.fc_out = nn.Linear(hidden_dim, input_dim, dtype=torch.float64)  # predict offset (dx, dy, dw, dh)
 
-class SequenceLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
+    def forward(self, src, trg=None, teacher_forcing_ratio=0.5):
+        # src: (batch, seq_len, 4)
+        # trg: (batch, seq_len, 4) - ground truth future sequence
 
-    def forward(self, pred, target, mask):
-        diff = pred - target
-        l1 = torch.abs(diff)[mask].mean()
-        l2 = (diff ** 2)[mask].mean()
-        return l1 + l2
+        batch_size, seq_len, _ = src.size()
+        outputs = []
+
+        # Encode
+        _, (hidden, cell) = self.encoder(src)
+
+        # First input to decoder is the last frame of src
+        decoder_input = src[:, -1:, :]  # shape (batch, 1, 4)
+
+        for t in range(seq_len):
+            out, (hidden, cell) = self.decoder(decoder_input, (hidden, cell))
+            pred = self.fc_out(out)  # (batch, 1, 4)
+            outputs.append(pred)
+
+            # Decide if we use teacher forcing
+            use_teacher = trg is not None and random.random() < teacher_forcing_ratio
+            decoder_input = trg[:, t:t+1, :] if use_teacher else pred
+
+        outputs = torch.cat(outputs, dim=1)  # (batch, seq_len, 4)
+        return outputs
+
+# ----------------------------
+# Training & Evaluation Loops
+# ----------------------------
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device, teacher_forcing_ratio=0.5):
+    model.train()
+    total_loss = 0
+
+    for src, trg in dataloader:
+        src, trg = src.to(device), trg.to(device)
+
+        optimizer.zero_grad()
+        output = model(src, trg, teacher_forcing_ratio)
+
+        loss = criterion(output, trg)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
 
 
-# Hyperparameters
-EPOCHS = 150
-initial_teacher_ratio = 1
-lst_model = LSTM(4, 32, 64, 8, dropout=0.1).cuda()
-criterion = SequenceLoss()
-optimizer = torch.optim.Adam(lst_model.parameters(), lr=5e-2, weight_decay=1e-5)
-# Scheduler after EPOCHS defined
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for src, trg in dataloader:
+            src, trg = src.to(device), trg.to(device)
+            output = model(src, trg, teacher_forcing_ratio=0.0)  # no teacher forcing at eval
+            loss = criterion(output, trg)
+            total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+# ----------------------------
+# Main Training Script
+# ----------------------------
+
+# def train_model(train_loader, val_loader, num_epochs=20, lr=1e-3, teacher_forcing_ratio=0.5, device="cuda"):
+model = LSTMPredictor().to(device)
+criterion = nn.MSELoss()  # predicting offsets → regression
+optimizer = optim.Adam(model.parameters(), lr=lr)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+num_epochs = 50
+lr = 1e-3
+teacher_forcing_ratio = 1   ``
+device="cuda"
+
+best_val_loss = float("inf")
+
+for epoch in range(1, num_epochs + 1):
+    train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, teacher_forcing_ratio)
+    val_loss = evaluate(model, val_loader, criterion, device)
+
+    scheduler.step()
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), "best_lstm_model.pth")
+
+    current_lr = scheduler.get_last_lr()[0]
+    print(f"Epoch {epoch}: Train Loss = {train_loss:.8f}, Val Loss = {val_loss:.8f}, LR = {current_lr:.8f}")
+
+print("Training complete. Best Val Loss:", best_val_loss)
+return model
+
+
+# train_model(train_loader, val_loader, num_epochs=50, lr=1e-3, teacher_forcing_ratio=1)
