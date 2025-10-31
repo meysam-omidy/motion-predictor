@@ -85,13 +85,13 @@ class ImprovedLSTMPredictor(nn.Module):
         return torch.cat(outputs, dim=1)
 
 
-    def train_one_epoch(self, dataloader, optimizer, criterion, teacher_forcing_ratio=0.5):
+    def train_one_epoch(self, dataloader, optimizer, criterion, teacher_forcing_ratio=0.5, device='cuda'):
         self.train()
         total_loss = 0
 
         for src, trg in dataloader:
-            src = src.to(self.device)
-            trg = trg.to(self.device)
+            src = src.to(device)
+            trg = trg.to(device)
 
             optimizer.zero_grad()
             output = self.forward(src, trg[:, :-1], teacher_forcing_ratio)
@@ -106,14 +106,14 @@ class ImprovedLSTMPredictor(nn.Module):
         return total_loss / len(dataloader)
 
 
-    def evaluate(self, dataloader, criterion):
+    def evaluate(self, dataloader, criterion, device='cuda'):
         self.eval()
         total_loss = 0
 
         with torch.no_grad():
             for src, trg in dataloader:
-                src = src.to(self.device)
-                trg = trg.to(self.device)
+                src = src.to(device)
+                trg = trg.to(device)
                 output = self.inference(src, trg, num_steps=trg.size(1) - 1)
                 loss = criterion(output, trg[:, 1:])
                 total_loss += loss.item()
