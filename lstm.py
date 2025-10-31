@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import random
+import os
 
 class ImprovedLSTMPredictor(nn.Module):
     def __init__(self, input_dim=4, middle_dim=16, hidden_dim=64, num_layers=2, dropout=0.2):
@@ -121,6 +122,7 @@ class ImprovedLSTMPredictor(nn.Module):
         return total_loss / len(dataloader)
     
     def save_weight(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(self.state_dict(), path)
 
     def load_weight(self, path):
