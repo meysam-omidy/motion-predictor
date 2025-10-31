@@ -12,7 +12,7 @@ def has_jump(seq):
 class GTSequenceDataset(Dataset):
 
     @staticmethod
-    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise):
+    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff):
         sources = []
         targets = []
 
@@ -23,6 +23,7 @@ class GTSequenceDataset(Dataset):
         cfp.read(os.path.join(seq_path, 'seqinfo.ini'))
         image_width = np.array(cfp['Sequence']['imWidth']).astype(float)
         image_height = np.array(cfp['Sequence']['imHeight']).astype(float)
+        borders = np.array([image_width, image_height, image_width, image_height]).astype(float)
 
         df = pd.read_csv(gt_path, header=None)
         df.columns = ['frame', 'id', 'x', 'y', 'w', 'h', 'conf', 'class', 'visibility']
@@ -32,14 +33,16 @@ class GTSequenceDataset(Dataset):
             obj_df['w'] += obj_df['x']
             obj_df['h'] += obj_df['y']
             bboxes = obj_df[['x', 'y', 'w', 'h']].to_numpy().astype(float)
-            borders = np.array([image_width, image_height, image_width, image_height]).astype(float)
-            if noise:
-                bboxes += np.random.randn(bboxes.shape[0], bboxes.shape[1]) * 0.02 * borders
             bboxes /= borders
             frames_total = obj_df['frame'].to_numpy()
-            # create sequences of length seq_len
+
             for i in range(len(bboxes) - seq_total_len): 
                 seq = bboxes[i:i+seq_total_len]
+                if noise_prob is not None:
+                    if np.random.randn() < noise_prob:
+                        seq += np.random.randn(seq.shape[0], seq.shape[1]) * noise_coeff
+                        # seq += np.random.randn(seq.shape[0], seq.shape[1]) * noise_coeff * borders
+                # seq /= borders
                 frames = frames_total[i:i+seq_total_len]
                     
                 if not random_jump:
@@ -60,9 +63,9 @@ class GTSequenceDataset(Dataset):
 
 
     @classmethod
-    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise=True):
+    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None):
         obj = cls()
-        sources, targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise)
+        sources, targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff)
         obj.sources = np.array(sources, dtype=np.float32)
         obj.targets = np.array(targets, dtype=np.float32)
         obj.image_width = image_width
@@ -71,14 +74,14 @@ class GTSequenceDataset(Dataset):
     
 
     @classmethod
-    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise=True):
+    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None):
         sources = []
         targets = []
 
         for root in root_dirs:
             sequences = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
             for seq_path in sequences:
-                sources_, targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise)
+                sources_, targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff)
                 sources.extend(sources_)
                 targets.extend(targets_)
 
