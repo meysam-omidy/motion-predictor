@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import random
 import configparser
+from copy import copy
 
 def has_jump(seq):
     return not ((seq[-1]- seq[0] + 1) == len(seq))
@@ -37,12 +38,12 @@ class GTSequenceDataset(Dataset):
             frames_total = obj_df['frame'].to_numpy()
 
             for i in range(len(bboxes) - seq_total_len): 
-                seq = bboxes[i:i+seq_total_len]
+                seq = copy(bboxes[i:i+seq_total_len])
                 if noise_prob is not None:
-                    if np.random.randn() < noise_prob:
-                        seq += np.random.randn(seq.shape[0], seq.shape[1]) * noise_coeff
-                        # seq += np.random.randn(seq.shape[0], seq.shape[1]) * noise_coeff * borders
-                # seq /= borders
+                    if random.random() < noise_prob:
+                        var = (seq[1:] - seq[:-1]).mean(axis=0).__abs__() 
+                        dist = np.random.randn(seq.shape[0], seq.shape[1]) * var * noise_coeff
+                        seq += dist
                 frames = frames_total[i:i+seq_total_len]
                     
                 if not random_jump:
