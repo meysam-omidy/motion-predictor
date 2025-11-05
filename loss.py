@@ -19,5 +19,5 @@ class LossFunction(nn.Module):
         ious = torch.diagonal(ious, dim1=1, dim2=2)
         loss1 = nn.functional.l1_loss(ious, torch.ones_like(ious))
         loss2 = nn.functional.smooth_l1_loss(targets, preds)
-        # return loss1
-        return loss1 + loss2
+        return loss2
+        # return loss1 + loss2
