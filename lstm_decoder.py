@@ -8,7 +8,10 @@ class LSTMPredictor(nn.Module):
         super(LSTMPredictor, self).__init__()
 
         self.fc_in = nn.Linear(input_dim, middle_dim, dtype=torch.float32)
-        self.decoder = nn.LSTM(middle_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, dtype=torch.float32)
+        if num_layers > 1:
+            self.decoder = nn.LSTM(middle_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, dtype=torch.float32)
+        else:
+            self.decoder = nn.LSTM(middle_dim, hidden_dim, num_layers, batch_first=True, dtype=torch.float32)
         self.fc_out = nn.Linear(hidden_dim, input_dim, dtype=torch.float32)  # predict offset (dx, dy, dw, dh)
 
     def forward(self, src, trg, teacher_forcing_ratio=0.5):
@@ -85,7 +88,8 @@ class LSTMPredictor(nn.Module):
             for src, trg in dataloader:
                 src = src.to(device)
                 trg = trg.to(device)
-                output = self.inference(src, trg, num_steps=trg.size(1) - 1)
+                # output = self.inference(src, trg, num_steps=trg.size(1) - 1)
+                output = self.forward(src, trg[:, :-1], 0)
                 loss = criterion(output, trg[:, 1:])
                 total_loss += loss.item()
 
