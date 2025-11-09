@@ -10,10 +10,24 @@ from copy import copy
 def has_jump(seq):
     return not ((seq[-1]- seq[0] + 1) == len(seq))
 
+def batch_iou(bb1, bb2):
+    bb1 = np.expand_dims(bb1, 1)
+    bb2 = np.expand_dims(bb2, 0)
+    xx1 = np.maximum(bb1[..., 0], bb2[..., 0])
+    yy1 = np.maximum(bb1[..., 1], bb2[..., 1])
+    xx2 = np.minimum(bb1[..., 2], bb2[..., 2])
+    yy2 = np.minimum(bb1[..., 3], bb2[..., 3])
+    w = np.maximum(0., xx2 - xx1)
+    h = np.maximum(0., yy2 - yy1)
+    wh = w * h
+    o = wh / ((bb1[..., 2] - bb1[..., 0]) * (bb1[..., 3] - bb1[..., 1])                                      
+        + (bb2[..., 2] - bb2[..., 0]) * (bb2[..., 3] - bb2[..., 1]) - wh)                                              
+    return(o) 
+
 class GTSequenceDataset(Dataset):
 
     @staticmethod
-    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff):
+    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob):
         sources = []
         targets = []
 
@@ -39,18 +53,26 @@ class GTSequenceDataset(Dataset):
 
             for i in range(len(bboxes) - seq_total_len): 
                 seq = copy(bboxes[i:i+seq_total_len])
+                seq_c = np.zeros(shape=(len(seq), 5))
                 if noise_prob is not None:
-                    if random.random() < noise_prob:
-                        var = (seq[1:] - seq[:-1]).mean(axis=0).__abs__() 
-                        dist = np.random.randn(seq.shape[0], seq.shape[1]) * var * noise_coeff
-                        seq += dist
+                    var = (seq[1:] - seq[:-1]).mean(axis=0).__abs__() 
+                    noise_probs_bool = np.random.random(size=(seq.shape[0], 1)) > noise_prob
+                    noise = np.random.randn(seq.shape[0], seq.shape[1]) * var * noise_coeff
+                    seq_noised = np.where(noise_probs_bool, seq, seq + noise)
+                    ious = np.diag(batch_iou(seq, seq_noised))
+                    
+                else:
+                    seq_noised = copy(seq)
+                    ious = np.ones(shape=(len(seq)))
+                seq_c[:, :4] = seq_noised
+                seq_c[:, 4] = ious
                 frames = frames_total[i:i+seq_total_len]
                     
                 if not random_jump:
                     if has_jump(frames[:seq_in_len]) or has_jump(frames[-seq_out_len:]):
                         continue
-                    sources.append(seq[:seq_in_len])
-                    targets.append(seq[-seq_out_len:])
+                    sources.append(seq_c[:seq_in_len])
+                    targets.append(seq_c[-seq_out_len:])
                 else:
                     index_1 = random.randint(0, int(seq_total_len / 2) - seq_in_len - 1)
                     index_2 = random.randint(0, int(seq_total_len / 2) - seq_in_len - 1)
@@ -64,9 +86,9 @@ class GTSequenceDataset(Dataset):
 
 
     @classmethod
-    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None):
+    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None):
         obj = cls()
-        sources, targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff)
+        sources, targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob)
         obj.sources = np.array(sources, dtype=np.float32)
         obj.targets = np.array(targets, dtype=np.float32)
         obj.image_width = image_width
@@ -75,14 +97,14 @@ class GTSequenceDataset(Dataset):
     
 
     @classmethod
-    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None):
+    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None):
         sources = []
         targets = []
 
         for root in root_dirs:
             sequences = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
             for seq_path in sequences:
-                sources_, targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff)
+                sources_, targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob)
                 sources.extend(sources_)
                 targets.extend(targets_)
 
