@@ -5,13 +5,15 @@ This script includes best practices for handling diverse datasets like MOT17 and
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, random_split
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts, ReduceLROnPlateau
 import numpy as np
 from pathlib import Path
 import argparse
 from tqdm import tqdm
+import json
+import time
 
 from dataset import GTSequenceDataset
 from transformer_encoder import MotionTransformer
@@ -115,7 +117,23 @@ def evaluate(model, dataloader, criterion, device, dataset_name=""):
     return avg_loss, avg_pixel_error
 
 
+def set_seed(seed):
+    """Set random seed for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    # For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main(args):
+    # Set random seed for reproducibility
+    set_seed(args.seed)
+    print(f"Random seed set to: {args.seed}")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -180,15 +198,37 @@ def main(args):
     
     if len(datasets) > 1:
         # Combine datasets
-        train_dataset = ConcatDataset(datasets)
-        print(f"Combined dataset: {len(train_dataset)} samples")
+        full_dataset = ConcatDataset(datasets)
+        print(f"Combined dataset: {len(full_dataset)} samples")
     else:
-        train_dataset = datasets[0]
+        full_dataset = datasets[0]
+    
+    # Split into train and validation sets
+    total_size = len(full_dataset)
+    val_size = int(total_size * args.val_split)
+    train_size = total_size - val_size
+    
+    train_dataset, val_dataset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed)
+    )
+    
+    print(f"Train set: {len(train_dataset)} samples")
+    print(f"Validation set: {len(val_dataset)} samples")
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True
     )
@@ -235,6 +275,7 @@ def main(args):
             pct_start=0.1,
             anneal_strategy='cos'
         )
+        scheduler_type = 'step'  # Update per batch
     elif args.scheduler == 'cosine':
         scheduler = CosineAnnealingWarmRestarts(
             optimizer,
@@ -242,49 +283,182 @@ def main(args):
             T_mult=2,
             eta_min=args.lr * 0.01
         )
+        scheduler_type = 'step'  # Update per batch
+    elif args.scheduler == 'plateau':
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=args.patience // 2,  # Reduce LR before early stopping
+            verbose=True,
+            min_lr=args.lr * 0.001
+        )
+        scheduler_type = 'epoch'  # Update per epoch based on validation
     else:
         scheduler = None
+        scheduler_type = None
     
-    # Training loop
-    best_loss = float('inf')
+    # Training loop with validation and early stopping
+    best_val_loss = float('inf')
+    best_train_loss = float('inf')
+    patience_counter = 0
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
+    # Training history
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'learning_rates': [],
+        'epochs': []
+    }
+    
     print("\nStarting training...")
+    print(f"Total epochs: {args.epochs}")
+    print(f"Early stopping patience: {args.patience}")
+    print(f"Validation split: {args.val_split:.1%}")
+    print(f"Learning rate scheduler: {args.scheduler}")
+    print("="*60)
+    
+    start_time = time.time()
+    
     for epoch in range(args.epochs):
+        epoch_start = time.time()
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        print("-" * 60)
         
+        # Training phase
         train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, device, scheduler
+            model, train_loader, optimizer, criterion, device, 
+            scheduler if scheduler_type == 'step' else None
         )
         
-        print(f"Train Loss: {train_loss:.4f}")
+        # Validation phase
+        val_loss, val_pixel_error = evaluate(
+            model, val_loader, criterion, device, "Validation"
+        )
         
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
-            checkpoint_path = save_dir / f"checkpoint_epoch_{epoch+1}.pth"
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Update learning rate based on validation loss (if using plateau scheduler)
+        if scheduler_type == 'epoch' and scheduler is not None:
+            scheduler.step(val_loss)
+        
+        # Save history
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['learning_rates'].append(current_lr)
+        history['epochs'].append(epoch + 1)
+        
+        # Print epoch summary
+        epoch_time = time.time() - epoch_start
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch + 1} Summary:")
+        print(f"  Train Loss:      {train_loss:.4f}")
+        print(f"  Val Loss:        {val_loss:.4f}")
+        print(f"  Val Pixel Error: {val_pixel_error:.4f}")
+        print(f"  Learning Rate:   {current_lr:.2e}")
+        print(f"  Epoch Time:      {epoch_time:.1f}s")
+        print(f"{'='*60}")
+        
+        # Check if this is the best model based on VALIDATION loss
+        improved = False
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_train_loss = train_loss
+            patience_counter = 0
+            improved = True
+            
+            # Save best model
+            best_model_path = save_dir / "best_model.pth"
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
-                'args': vars(args)
-            }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
-        
-        if train_loss < best_loss:
-            best_loss = train_loss
-            best_model_path = save_dir / "best_model.pth"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_pixel_error': val_pixel_error,
                 'args': vars(args)
             }, best_model_path)
-            print(f"Saved best model to {best_model_path}")
+            print(f"✓ New best model saved! Val loss: {val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"✗ No improvement. Patience: {patience_counter}/{args.patience}")
+        
+        # Save periodic checkpoint
+        if (epoch + 1) % args.save_every == 0:
+            checkpoint_path = save_dir / f"checkpoint_epoch_{epoch+1}.pth"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_pixel_error': val_pixel_error,
+                'history': history,
+                'args': vars(args)
+            }, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+        
+        # Early stopping
+        if patience_counter >= args.patience:
+            print(f"\n{'='*60}")
+            print(f"Early stopping triggered after {epoch + 1} epochs")
+            print(f"No improvement for {args.patience} consecutive epochs")
+            print(f"{'='*60}")
+            break
     
-    print("\nTraining completed!")
-    print(f"Best train loss: {best_loss:.4f}")
+    # Training completed
+    total_time = time.time() - start_time
+    print("\n" + "="*60)
+    print("Training completed!")
+    print(f"Total training time: {total_time/3600:.2f} hours")
+    print(f"Best validation loss: {best_val_loss:.4f} (at epoch {history['val_loss'].index(best_val_loss) + 1})")
+    print(f"Corresponding train loss: {best_train_loss:.4f}")
+    print(f"Best model saved to: {save_dir / 'best_model.pth'}")
+    print("="*60)
+    
+    # Save training history
+    history_path = save_dir / "training_history.json"
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f"\nTraining history saved to {history_path}")
+    
+    # Plot training curves if matplotlib is available
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # Loss curves
+        epochs = history['epochs']
+        ax1.plot(epochs, history['train_loss'], label='Train Loss', marker='o')
+        ax1.plot(epochs, history['val_loss'], label='Val Loss', marker='s')
+        ax1.axvline(x=history['val_loss'].index(min(history['val_loss'])) + 1, 
+                   color='g', linestyle='--', label='Best Model', alpha=0.7)
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training and Validation Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Learning rate
+        ax2.plot(epochs, history['learning_rates'], marker='o', color='orange')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Learning Rate')
+        ax2.set_title('Learning Rate Schedule')
+        ax2.set_yscale('log')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = save_dir / "training_curves.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"Training curves saved to {plot_path}")
+        plt.close()
+    except ImportError:
+        print("Note: Install matplotlib to automatically generate training curve plots")
 
 
 if __name__ == "__main__":
@@ -328,8 +502,17 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
-    parser.add_argument("--scheduler", type=str, default="onecycle", 
-                        choices=["onecycle", "cosine", "none"], help="LR scheduler")
+    parser.add_argument("--scheduler", type=str, default="plateau", 
+                        choices=["onecycle", "cosine", "plateau", "none"], 
+                        help="LR scheduler (plateau recommended for validation-based training)")
+    
+    # Validation and early stopping
+    parser.add_argument("--val_split", type=float, default=0.15, 
+                        help="Fraction of data to use for validation (default: 0.15 = 15%%)")
+    parser.add_argument("--patience", type=int, default=20, 
+                        help="Early stopping patience (epochs without improvement)")
+    parser.add_argument("--seed", type=int, default=42, 
+                        help="Random seed for reproducibility")
     
     # System
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
