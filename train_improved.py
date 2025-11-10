@@ -139,83 +139,68 @@ def main(args):
     
     # Dataset configuration
     print("Loading datasets...")
+    print("="*60)
     
-    # Load MOT17 dataset
-    if args.mot17_path:
-        train_mot17 = GTSequenceDataset.from_roots(
-            root_dirs=[args.mot17_path],
-            seq_in_len=args.seq_in_len,
-            seq_out_len=args.seq_out_len,
-            seq_total_len=args.seq_total_len,
-            random_jump=args.random_jump,
-            noise_prob=args.noise_prob,
-            noise_coeff=args.noise_coeff,
-            random_drop_prob=args.random_drop_prob,
-            use_motion_features=args.use_motion_features
-        )
-        print(f"MOT17 dataset: {len(train_mot17)} samples")
-    else:
-        train_mot17 = None
+    # Collect train dataset paths
+    train_paths = []
+    if args.mot17_train_path:
+        train_paths.append(args.mot17_train_path)
+        print(f"MOT17 train: {args.mot17_train_path}")
+    if args.mot20_train_path:
+        train_paths.append(args.mot20_train_path)
+        print(f"MOT20 train: {args.mot20_train_path}")
+    if args.dancetrack_train_path:
+        train_paths.append(args.dancetrack_train_path)
+        print(f"DanceTrack train: {args.dancetrack_train_path}")
     
-    # Load MOT20 dataset
-    if args.mot20_path:
-        train_mot20 = GTSequenceDataset.from_roots(
-            root_dirs=[args.mot20_path],
-            seq_in_len=args.seq_in_len,
-            seq_out_len=args.seq_out_len,
-            seq_total_len=args.seq_total_len,
-            random_jump=args.random_jump,
-            noise_prob=args.noise_prob,
-            noise_coeff=args.noise_coeff,
-            random_drop_prob=args.random_drop_prob,
-            use_motion_features=args.use_motion_features
-        )
-        print(f"MOT20 dataset: {len(train_mot20)} samples")
-    else:
-        train_mot20 = None
+    if len(train_paths) == 0:
+        raise ValueError("At least one training dataset path must be provided")
     
-    # Load DanceTrack dataset
-    if args.dancetrack_path:
-        train_dancetrack = GTSequenceDataset.from_roots(
-            root_dirs=[args.dancetrack_path],
-            seq_in_len=args.seq_in_len,
-            seq_out_len=args.seq_out_len,
-            seq_total_len=args.seq_total_len,
-            random_jump=args.random_jump,
-            noise_prob=args.noise_prob,
-            noise_coeff=args.noise_coeff,
-            random_drop_prob=args.random_drop_prob,
-            use_motion_features=args.use_motion_features
-        )
-        print(f"DanceTrack dataset: {len(train_dancetrack)} samples")
-    else:
-        train_dancetrack = None
-    
-    # Combine datasets with balanced sampling
-    datasets = [d for d in [train_mot17, train_mot20, train_dancetrack] if d is not None]
-    if len(datasets) == 0:
-        raise ValueError("At least one dataset path must be provided")
-    
-    if len(datasets) > 1:
-        # Combine datasets
-        full_dataset = ConcatDataset(datasets)
-        print(f"Combined dataset: {len(full_dataset)} samples")
-    else:
-        full_dataset = datasets[0]
-    
-    # Split into train and validation sets
-    total_size = len(full_dataset)
-    val_size = int(total_size * args.val_split)
-    train_size = total_size - val_size
-    
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed)
+    # Load training dataset
+    print("\nLoading training data...")
+    train_dataset = GTSequenceDataset.from_roots(
+        root_dirs=train_paths,
+        seq_in_len=args.seq_in_len,
+        seq_out_len=args.seq_out_len,
+        seq_total_len=args.seq_total_len,
+        random_jump=args.random_jump,
+        noise_prob=args.noise_prob,
+        noise_coeff=args.noise_coeff,
+        random_drop_prob=args.random_drop_prob,
+        use_motion_features=args.use_motion_features
     )
+    print(f"Training set: {len(train_dataset)} samples")
     
-    print(f"Train set: {len(train_dataset)} samples")
+    # Collect validation dataset paths
+    val_paths = []
+    if args.mot17_val_path:
+        val_paths.append(args.mot17_val_path)
+        print(f"\nMOT17 val: {args.mot17_val_path}")
+    if args.mot20_val_path:
+        val_paths.append(args.mot20_val_path)
+        print(f"MOT20 val: {args.mot20_val_path}")
+    if args.dancetrack_val_path:
+        val_paths.append(args.dancetrack_val_path)
+        print(f"DanceTrack val: {args.dancetrack_val_path}")
+    
+    if len(val_paths) == 0:
+        raise ValueError("At least one validation dataset path must be provided")
+    
+    # Load validation dataset (with optional different augmentation)
+    print("\nLoading validation data...")
+    val_dataset = GTSequenceDataset.from_roots(
+        root_dirs=val_paths,
+        seq_in_len=args.seq_in_len,
+        seq_out_len=args.seq_out_len,
+        seq_total_len=args.seq_total_len,
+        random_jump=False,  # No random jump for validation
+        noise_prob=args.val_noise_prob if args.val_noise_prob is not None else None,
+        noise_coeff=args.val_noise_coeff if args.val_noise_prob is not None else None,
+        random_drop_prob=None,  # No random drop for validation
+        use_motion_features=args.use_motion_features
+    )
     print(f"Validation set: {len(val_dataset)} samples")
+    print("="*60)
     
     train_loader = DataLoader(
         train_dataset,
@@ -316,7 +301,8 @@ def main(args):
     print("\nStarting training...")
     print(f"Total epochs: {args.epochs}")
     print(f"Early stopping patience: {args.patience}")
-    print(f"Validation split: {args.val_split:.1%}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
     print(f"Learning rate scheduler: {args.scheduler}")
     print("="*60)
     
@@ -464,10 +450,21 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train motion prediction transformer")
     
-    # Dataset paths
-    parser.add_argument("--mot17_path", type=str, default=None, help="Path to MOT17 dataset")
-    parser.add_argument("--mot20_path", type=str, default=None, help="Path to MOT20 dataset")
-    parser.add_argument("--dancetrack_path", type=str, default=None, help="Path to DanceTrack dataset")
+    # Training dataset paths
+    parser.add_argument("--mot17_train_path", type=str, default=None, 
+                        help="Path to MOT17 train dataset (e.g., /path/to/MOT17/train)")
+    parser.add_argument("--mot20_train_path", type=str, default=None, 
+                        help="Path to MOT20 train dataset (e.g., /path/to/MOT20/train)")
+    parser.add_argument("--dancetrack_train_path", type=str, default=None, 
+                        help="Path to DanceTrack train dataset (e.g., /path/to/DanceTrack/train)")
+    
+    # Validation dataset paths
+    parser.add_argument("--mot17_val_path", type=str, default=None, 
+                        help="Path to MOT17 val dataset (e.g., /path/to/MOT17/val)")
+    parser.add_argument("--mot20_val_path", type=str, default=None, 
+                        help="Path to MOT20 val dataset (e.g., /path/to/MOT20/val)")
+    parser.add_argument("--dancetrack_val_path", type=str, default=None, 
+                        help="Path to DanceTrack val dataset (e.g., /path/to/DanceTrack/val)")
     
     # Sequence parameters
     parser.add_argument("--seq_in_len", type=int, default=20, help="Input sequence length")
@@ -475,10 +472,17 @@ if __name__ == "__main__":
     parser.add_argument("--seq_total_len", type=int, default=30, help="Total sequence length")
     parser.add_argument("--random_jump", action="store_true", help="Use random jump augmentation")
     
-    # Augmentation
-    parser.add_argument("--noise_prob", type=float, default=0.3, help="Probability of adding noise")
-    parser.add_argument("--noise_coeff", type=float, default=0.1, help="Noise coefficient")
-    parser.add_argument("--random_drop_prob", type=float, default=None, help="Probability of randomly dropping frames (simulating missing detections)")
+    # Training augmentation
+    parser.add_argument("--noise_prob", type=float, default=0.3, help="Probability of adding noise to training data")
+    parser.add_argument("--noise_coeff", type=float, default=0.1, help="Noise coefficient for training data")
+    parser.add_argument("--random_drop_prob", type=float, default=None, 
+                        help="Probability of randomly dropping frames in training (simulating missing detections)")
+    
+    # Validation augmentation (optional, usually less aggressive)
+    parser.add_argument("--val_noise_prob", type=float, default=None, 
+                        help="Probability of adding noise to validation data (default: None = no noise)")
+    parser.add_argument("--val_noise_coeff", type=float, default=0.5, 
+                        help="Noise coefficient for validation data (if val_noise_prob is set)")
     
     # Model architecture
     parser.add_argument("--use_motion_features", action="store_true", default=True, 
@@ -507,8 +511,6 @@ if __name__ == "__main__":
                         help="LR scheduler (plateau recommended for validation-based training)")
     
     # Validation and early stopping
-    parser.add_argument("--val_split", type=float, default=0.15, 
-                        help="Fraction of data to use for validation (default: 0.15 = 15%%)")
     parser.add_argument("--patience", type=int, default=20, 
                         help="Early stopping patience (epochs without improvement)")
     parser.add_argument("--seed", type=int, default=42, 

@@ -31,6 +31,9 @@ class GTSequenceDataset(Dataset):
         """
         Compute velocity and acceleration features for better motion modeling.
         Returns enhanced features: [x, y, w, h, vx, vy, vw, vh, ax, ay, aw, ah]
+        
+        Note: First frame has zero velocity, first two frames have zero acceleration.
+        This is correct as we don't have previous frames to compute derivatives.
         """
         n = len(bboxes)
         enhanced = np.zeros((n, 12))
@@ -40,13 +43,13 @@ class GTSequenceDataset(Dataset):
         if n > 1:
             velocity = np.diff(bboxes, axis=0)
             enhanced[1:, 4:8] = velocity
-            enhanced[0, 4:8] = velocity[0] if len(velocity) > 0 else 0
+            # First frame velocity = 0 (no previous frame)
             
         # Acceleration (second-order difference)
         if n > 2:
             acceleration = np.diff(velocity, axis=0)
             enhanced[2:, 8:12] = acceleration
-            enhanced[0:2, 8:12] = acceleration[0] if len(acceleration) > 0 else 0
+            # First two frames acceleration = 0 (need at least 3 frames)
             
         return enhanced
 
@@ -92,11 +95,48 @@ class GTSequenceDataset(Dataset):
                 seq_c = np.zeros(shape=(len(seq), feature_dim))
                 seq_c_noised = np.zeros(shape=(len(seq), feature_dim))
                 
-                if noise_prob is not None:
-                    var = (seq[1:] - seq[:-1]).mean(axis=0).__abs__() 
-                    noise_probs_bool = np.random.random(size=(seq.shape[0], 1)) > noise_prob
-                    noise = np.random.randn(seq.shape[0], seq.shape[1]) * var * noise_coeff
-                    seq_noised = np.where(noise_probs_bool, seq, seq + noise)
+                if noise_prob is not None and noise_prob > 0:
+                    # Apply noise to bbox coordinates
+                    seq_noised = copy(seq)
+                    
+                    for t in range(len(seq)):
+                        if np.random.random() < noise_prob:
+                            # Original bbox
+                            x1, y1, x2, y2 = seq[t]
+                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                            w, h = x2 - x1, y2 - y1
+                            
+                            # Add noise to center position (Gaussian)
+                            # Noise proportional to bbox size
+                            pos_noise_x = np.random.randn() * w * noise_coeff
+                            pos_noise_y = np.random.randn() * h * noise_coeff
+                            cx_noised = cx + pos_noise_x
+                            cy_noised = cy + pos_noise_y
+                            
+                            # Add noise to scale (log-normal for positive scale changes)
+                            scale_noise = np.random.randn() * noise_coeff
+                            scale_factor = np.exp(scale_noise)  # Always positive
+                            w_noised = w * scale_factor
+                            h_noised = h * scale_factor
+                            
+                            # Reconstruct bbox
+                            x1_noised = cx_noised - w_noised / 2
+                            y1_noised = cy_noised - h_noised / 2
+                            x2_noised = cx_noised + w_noised / 2
+                            y2_noised = cy_noised + h_noised / 2
+                            
+                            # Clip to valid range [0, 1] and ensure x1 < x2, y1 < y2
+                            x1_noised = np.clip(x1_noised, 0, 1)
+                            y1_noised = np.clip(y1_noised, 0, 1)
+                            x2_noised = np.clip(x2_noised, 0, 1)
+                            y2_noised = np.clip(y2_noised, 0, 1)
+                            
+                            # Ensure valid bbox (min < max)
+                            if x2_noised > x1_noised and y2_noised > y1_noised:
+                                seq_noised[t] = [x1_noised, y1_noised, x2_noised, y2_noised]
+                            # else: keep original bbox if noise makes it invalid
+                    
+                    # Compute IoU between original and noised sequences
                     ious = np.diag(batch_iou(seq, seq_noised))
                     
                     if use_motion_features:
