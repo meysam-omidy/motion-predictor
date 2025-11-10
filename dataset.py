@@ -27,7 +27,31 @@ def batch_iou(bb1, bb2):
 class GTSequenceDataset(Dataset):
 
     @staticmethod
-    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob):
+    def compute_motion_features(bboxes):
+        """
+        Compute velocity and acceleration features for better motion modeling.
+        Returns enhanced features: [x, y, w, h, vx, vy, vw, vh, ax, ay, aw, ah]
+        """
+        n = len(bboxes)
+        enhanced = np.zeros((n, 12))
+        enhanced[:, :4] = bboxes
+        
+        # Velocity (first-order difference)
+        if n > 1:
+            velocity = np.diff(bboxes, axis=0)
+            enhanced[1:, 4:8] = velocity
+            enhanced[0, 4:8] = velocity[0] if len(velocity) > 0 else 0
+            
+        # Acceleration (second-order difference)
+        if n > 2:
+            acceleration = np.diff(velocity, axis=0)
+            enhanced[2:, 8:12] = acceleration
+            enhanced[0:2, 8:12] = acceleration[0] if len(acceleration) > 0 else 0
+            
+        return enhanced
+
+    @staticmethod
+    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features=True):
         sources = []
         gt_sources = []
         targets = []
@@ -55,25 +79,64 @@ class GTSequenceDataset(Dataset):
 
             for i in range(len(bboxes) - seq_total_len): 
                 seq = copy(bboxes[i:i+seq_total_len])
-                seq_c = np.zeros(shape=(len(seq), 5))
-                seq_c_noised = np.zeros(shape=(len(seq), 5))
+                
+                # Compute motion features if enabled
+                if use_motion_features:
+                    seq_enhanced = GTSequenceDataset.compute_motion_features(seq)
+                    feature_dim = 13  # 12 motion features + 1 IOU/confidence
+                else:
+                    seq_enhanced = np.zeros((len(seq), 5))
+                    seq_enhanced[:, :4] = seq
+                    feature_dim = 5
+                
+                seq_c = np.zeros(shape=(len(seq), feature_dim))
+                seq_c_noised = np.zeros(shape=(len(seq), feature_dim))
+                
                 if noise_prob is not None:
                     var = (seq[1:] - seq[:-1]).mean(axis=0).__abs__() 
                     noise_probs_bool = np.random.random(size=(seq.shape[0], 1)) > noise_prob
                     noise = np.random.randn(seq.shape[0], seq.shape[1]) * var * noise_coeff
                     seq_noised = np.where(noise_probs_bool, seq, seq + noise)
                     ious = np.diag(batch_iou(seq, seq_noised))
+                    
+                    if use_motion_features:
+                        seq_noised_enhanced = GTSequenceDataset.compute_motion_features(seq_noised)
+                        seq_c_noised[:, :-1] = seq_noised_enhanced
+                    else:
+                        seq_c_noised[:, :4] = seq_noised
                 else:
                     seq_noised = copy(seq)
                     ious = np.ones(shape=(len(seq)))
-                seq_c_noised[:, :4] = seq_noised
-                seq_c_noised[:, 4] = ious
-                seq_c[:, :4] = seq
-                seq_c[:, 4] = 1
+                    if use_motion_features:
+                        seq_c_noised[:, :-1] = seq_enhanced
+                    else:
+                        seq_c_noised[:, :4] = seq_noised
+                        
+                seq_c_noised[:, -1] = ious
+                
+                if use_motion_features:
+                    seq_c[:, :-1] = seq_enhanced
+                else:
+                    seq_c[:, :4] = seq
+                seq_c[:, -1] = 1
+                
                 frames = frames_total[i:i+seq_total_len]
 
                 if random_drop_prob is not None:
-                    pass
+                    # Randomly drop frames to simulate missing detections/occlusions
+                    # This makes the model robust to missing observations
+                    drop_mask = np.random.random(size=len(seq_c_noised)) < random_drop_prob
+                    
+                    # Set confidence to 0 for dropped frames (simulating missed detection)
+                    seq_c_noised[drop_mask, -1] = 0
+                    
+                    # Optionally zero out bbox coordinates for dropped frames
+                    # This simulates complete detection failure
+                    seq_c_noised[drop_mask, :4] = 0
+                    
+                    # If using motion features, also zero them out
+                    if use_motion_features and seq_c_noised.shape[1] == 13:
+                        seq_c_noised[drop_mask, 4:12] = 0
                     
                 if not random_jump:
                     if has_jump(frames[:seq_in_len]) or has_jump(frames[-seq_out_len:]):
@@ -97,20 +160,20 @@ class GTSequenceDataset(Dataset):
 
 
     @classmethod
-    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None):
+    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None, use_motion_features=True):
         obj = cls()
-        sources, targets, gt_sources, gt_targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob)
+        sources, targets, gt_sources, gt_targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
         obj.sources = np.array(sources, dtype=np.float32)
         obj.targets = np.array(targets, dtype=np.float32)
         obj.gt_sources = np.array(gt_sources, dtype=np.float32)
         obj.gt_targets = np.array(gt_targets, dtype=np.float32)
         obj.image_width = image_width
-        obj.image_height =image_height
+        obj.image_height = image_height
         return obj
     
 
     @classmethod
-    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None):
+    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None, use_motion_features=True):
         sources = []
         targets = []
         gt_sources = []
@@ -120,7 +183,7 @@ class GTSequenceDataset(Dataset):
         for root in root_dirs:
             sequences = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
             for seq_path in sequences:
-                sources_, targets_, gt_sources_, gt_targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob)
+                sources_, targets_, gt_sources_, gt_targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
                 sources.extend(sources_)
                 targets.extend(targets_)
                 gt_sources.extend(gt_sources_)
