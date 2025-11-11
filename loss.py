@@ -39,7 +39,8 @@ class LossFunction(nn.Module):
             # New format: 12 motion features + 1 confidence
             target_cs = targets[:, :, -1]
             pred_cs = preds[:, :, -1]
-            loss3 = nn.functional.smooth_l1_loss(target_cs, pred_cs)
+            loss3 = nn.functional.smooth_l1_loss(ious, pred_cs)
+            # loss3 = nn.functional.smooth_l1_loss(target_cs, pred_cs)
             
             # Add loss for velocity and acceleration predictions
             target_motion = targets[:, :, 4:12]  # velocity and acceleration
