@@ -21,21 +21,29 @@ class PositionalEncoding(nn.Module):
 # ---------- encoder–decoder transformer ----------
 class MotionTransformer(nn.Module):
     def __init__(self, 
-                 input_dim=4,
-                 d_model=128, 
+                 input_dim=13,  # Updated default: 12 motion features + 1 confidence
+                 d_model=256,   # Increased from 128 for more capacity
                  nhead=8,
-                 num_layers=3,
-                 dim_ff=512, 
+                 num_layers=6,  # Increased from 3 for complex motion patterns
+                 dim_ff=1024,   # Increased from 512
                  dropout=0.1,
+                 use_residual_prediction=True,  # Predict residuals from last known position
     ):
         super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
+        self.use_residual_prediction = use_residual_prediction
+        
+        # Deeper input embedding network
         self.in_fc = nn.Sequential(
             nn.Linear(input_dim, d_model // 4),
+            nn.LayerNorm(d_model // 4),
             nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(d_model // 4, d_model // 2),
+            nn.LayerNorm(d_model // 2),
             nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(d_model // 2, d_model)
         )
         self.pos_enc = PositionalEncoding(d_model)
@@ -46,16 +54,22 @@ class MotionTransformer(nn.Module):
                 dim_feedforward=dim_ff,
                 batch_first=True,
                 dropout=dropout,
+                activation='gelu',
             ),
             mask_check=False,
             num_layers=num_layers,
             norm=nn.LayerNorm(d_model)
         )
+        # Deeper output network
         self.out_fc = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
             nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(d_model // 2, d_model // 4),
+            nn.LayerNorm(d_model // 4),
             nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(d_model // 4, input_dim)
         )
 
@@ -71,7 +85,17 @@ class MotionTransformer(nn.Module):
         mask = self._mask(src.size(1), trg.size(1), input_tensor.device)
         out = self.transformer.forward(enc_emb, mask=mask)
         pred_offset = self.out_fc(out[:, -trg.size(1):, :])
-        return pred_offset + trg
+        
+        if self.use_residual_prediction:
+            # Predict offset from last known position for better generalization
+            # Use only the bbox coordinates (first 4 dims) from the last source frame
+            last_src_bbox = src[:, -1:, :4]  
+            pred_bbox = pred_offset[:, :, :4] + last_src_bbox
+            # Combine predicted bbox with predicted motion features and confidence
+            pred_full = torch.cat([pred_bbox, pred_offset[:, :, 4:]], dim=2)
+            return pred_full
+        else:
+            return pred_offset + trg
 
     @torch.no_grad()
     def inference(self, src, trg, num_steps=1):
