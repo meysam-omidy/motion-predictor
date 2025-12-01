@@ -133,6 +133,7 @@ def main(args):
     # Set random seed for reproducibility
     set_seed(args.seed)
     print(f"Random seed set to: {args.seed}")
+    print(f"args are {args}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -451,26 +452,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train motion prediction transformer")
     
     # Training dataset paths
-    parser.add_argument("--mot17_train_path", type=str, default=None, 
+    parser.add_argument("--mot17_train_path", type=str, default='../../Datasets/MOT17/train/', 
                         help="Path to MOT17 train dataset (e.g., /path/to/MOT17/train)")
-    parser.add_argument("--mot20_train_path", type=str, default=None, 
+    parser.add_argument("--mot20_train_path", type=str, default='../../Datasets/MOT20/train/', 
                         help="Path to MOT20 train dataset (e.g., /path/to/MOT20/train)")
-    parser.add_argument("--dancetrack_train_path", type=str, default=None, 
+    parser.add_argument("--dancetrack_train_path", type=str, default='../../Datasets/DanceTrack/train/', 
                         help="Path to DanceTrack train dataset (e.g., /path/to/DanceTrack/train)")
     
     # Validation dataset paths
-    parser.add_argument("--mot17_val_path", type=str, default=None, 
+    parser.add_argument("--mot17_val_path", type=str, default='../../Datasets/MOT17/val/', 
                         help="Path to MOT17 val dataset (e.g., /path/to/MOT17/val)")
-    parser.add_argument("--mot20_val_path", type=str, default=None, 
+    parser.add_argument("--mot20_val_path", type=str, default='../../Datasets/MOT20/val/', 
                         help="Path to MOT20 val dataset (e.g., /path/to/MOT20/val)")
-    parser.add_argument("--dancetrack_val_path", type=str, default=None, 
+    parser.add_argument("--dancetrack_val_path", type=str, default='../../Datasets/DanceTrack/val/', 
                         help="Path to DanceTrack val dataset (e.g., /path/to/DanceTrack/val)")
     
     # Sequence parameters
     parser.add_argument("--seq_in_len", type=int, default=20, help="Input sequence length")
     parser.add_argument("--seq_out_len", type=int, default=10, help="Output sequence length")
     parser.add_argument("--seq_total_len", type=int, default=30, help="Total sequence length")
-    parser.add_argument("--random_jump", action="store_true", help="Use random jump augmentation")
+    parser.add_argument("--random_jump", action="store_true", default=False, help="Use random jump augmentation")
     
     # Training augmentation
     parser.add_argument("--noise_prob", type=float, default=0.3, help="Probability of adding noise to training data")
@@ -479,7 +480,7 @@ if __name__ == "__main__":
                         help="Probability of randomly dropping frames in training (simulating missing detections)")
     
     # Validation augmentation (optional, usually less aggressive)
-    parser.add_argument("--val_noise_prob", type=float, default=None, 
+    parser.add_argument("--val_noise_prob", type=float, default=0.2, 
                         help="Probability of adding noise to validation data (default: None = no noise)")
     parser.add_argument("--val_noise_coeff", type=float, default=0.5, 
                         help="Noise coefficient for validation data (if val_noise_prob is set)")
