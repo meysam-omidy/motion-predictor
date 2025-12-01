@@ -65,7 +65,7 @@ class GTSequenceDataset(Dataset):
         return enhanced
 
     @staticmethod
-    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features=True):
+    def load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, steps, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features=True):
         sources = []
         gt_sources = []
         targets = []
@@ -73,7 +73,8 @@ class GTSequenceDataset(Dataset):
 
         gt_path = os.path.join(seq_path, 'gt', 'gt.txt')
         if not os.path.exists(gt_path):
-            return [], []
+            print('yes', seq_path)
+            return [], [], [], [], ()
         cfp = configparser.ConfigParser()
         cfp.read(os.path.join(seq_path, 'seqinfo.ini'))
         image_width = np.array(cfp['Sequence']['imWidth']).astype(float)
@@ -84,6 +85,7 @@ class GTSequenceDataset(Dataset):
         df.columns = ['frame', 'id', 'x', 'y', 'w', 'h', 'conf', 'class', 'visibility']
 
         for obj_id, obj_df in df.groupby('id'):
+            print(seq_path, obj_id)
             obj_df = obj_df.sort_values('frame')
             obj_df['x'] += obj_df['w'] / 2
             obj_df['y'] += obj_df['h'] / 2
@@ -94,7 +96,7 @@ class GTSequenceDataset(Dataset):
             bboxes /= borders
             frames_total = obj_df['frame'].to_numpy()
 
-            for i in range(len(bboxes) - seq_total_len): 
+            for i in range(0, len(bboxes) - seq_total_len, steps): 
                 seq = copy(bboxes[i:i+seq_total_len])
                 noise = np.random.randn(*(seq.shape))
                 noise[:, 0:2] *= seq[:, 2:4] * noise_coeff
@@ -157,9 +159,9 @@ class GTSequenceDataset(Dataset):
 
 
     @classmethod
-    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None, use_motion_features=True):
+    def from_sequence(cls, seq_path, seq_in_len=20, seq_out_len=10, seq_total_len=20, steps=20, random_jump=False, noise_prob=0, noise_coeff=0, random_drop_prob=None, use_motion_features=True):
         obj = cls()
-        sources, targets, gt_sources, gt_targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
+        sources, targets, gt_sources, gt_targets, (image_width, image_height) = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, steps, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
         obj.sources = np.array(sources, dtype=np.float32)
         obj.targets = np.array(targets, dtype=np.float32)
         obj.gt_sources = np.array(gt_sources, dtype=np.float32)
@@ -170,7 +172,7 @@ class GTSequenceDataset(Dataset):
     
 
     @classmethod
-    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, random_jump=False, noise_prob=None, noise_coeff=None, random_drop_prob=None, use_motion_features=True):
+    def from_roots(cls, root_dirs, seq_in_len=20, seq_out_len=10, seq_total_len=20, steps=20, random_jump=False, noise_prob=0, noise_coeff=0, random_drop_prob=None, use_motion_features=True):
         sources = []
         targets = []
         gt_sources = []
@@ -180,7 +182,7 @@ class GTSequenceDataset(Dataset):
         for root in root_dirs:
             sequences = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
             for seq_path in sequences:
-                sources_, targets_, gt_sources_, gt_targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
+                sources_, targets_, gt_sources_, gt_targets_, _ = cls.load_sequence(seq_path, seq_in_len, seq_out_len, seq_total_len, steps, random_jump, noise_prob, noise_coeff, random_drop_prob, use_motion_features)
                 sources.extend(sources_)
                 targets.extend(targets_)
                 gt_sources.extend(gt_sources_)

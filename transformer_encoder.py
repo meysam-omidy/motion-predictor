@@ -22,17 +22,16 @@ class PositionalEncoding(nn.Module):
 class MotionTransformer(nn.Module):
     def __init__(self, 
                  input_dim=13,  # Updated default: 12 motion features + 1 confidence
+                 output_dim=5,
                  d_model=256,   # Increased from 128 for more capacity
                  nhead=8,
                  num_layers=6,  # Increased from 3 for complex motion patterns
                  dim_ff=1024,   # Increased from 512
                  dropout=0.1,
-                 use_residual_prediction=True,  # Predict residuals from last known position
     ):
         super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
-        self.use_residual_prediction = use_residual_prediction
         
         # Deeper input embedding network
         self.in_fc = nn.Sequential(
@@ -70,7 +69,7 @@ class MotionTransformer(nn.Module):
             nn.LayerNorm(d_model // 4),
             nn.GELU(),
             nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 4, input_dim)
+            nn.Linear(d_model // 4, output_dim)
         )
 
     @staticmethod
@@ -84,18 +83,11 @@ class MotionTransformer(nn.Module):
         enc_emb = self.pos_enc(self.in_fc(input_tensor) * math.sqrt(self.d_model))
         mask = self._mask(src.size(1), trg.size(1), input_tensor.device)
         out = self.transformer.forward(enc_emb, mask=mask)
-        pred_offset = self.out_fc(out[:, -trg.size(1):, :])
-        
-        if self.use_residual_prediction:
-            # Predict offset from last known position for better generalization
-            # Use only the bbox coordinates (first 4 dims) from the last source frame
-            last_src_bbox = src[:, -1:, :4]  
-            pred_bbox = pred_offset[:, :, :4] + last_src_bbox
-            # Combine predicted bbox with predicted motion features and confidence
-            pred_full = torch.cat([pred_bbox, pred_offset[:, :, 4:]], dim=2)
-            return pred_full
-        else:
-            return pred_offset + trg
+        pred = self.out_fc(out[:, -trg.size(1):, :])
+        return torch.concat([
+            trg[:, :, :4] + pred[:, :, :4],
+            nn.functional.sigmoid(pred[:, :, 4:])
+        ], dim=-1)
 
     @torch.no_grad()
     def inference(self, src, trg, num_steps=1):
@@ -110,14 +102,16 @@ class MotionTransformer(nn.Module):
         self.train()
         total_loss = 0
 
-        for src, trg in dataloader:
+        for src, trg, gt_src, gt_trg in dataloader:
             src = src.to(device)
             trg = trg.to(device)
+            gt_src = gt_src.to(device)
+            gt_trg = gt_trg.to(device)
 
             optimizer.zero_grad()
             output = self.forward(src, trg[:, :-1])
 
-            loss = criterion(output, trg[:, 1:])
+            loss = criterion(output, gt_trg[:, 1:])
             loss.backward()
             # torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
             optimizer.step()
@@ -132,11 +126,13 @@ class MotionTransformer(nn.Module):
         total_loss = 0
 
         with torch.no_grad():
-            for src, trg in dataloader:
+            for src, trg, gt_src, gt_trg in dataloader:
                 src = src.to(device)
                 trg = trg.to(device)
-                output = self.inference(src, trg, num_steps=trg.size(1) - 1)
-                loss = criterion(output, trg[:, 1:])
+                gt_src = gt_src.to(device)
+                gt_trg = gt_trg.to(device)
+                output = self.forward(src, trg[:, :-1])
+                loss = criterion(output, gt_trg[:, 1:])
                 total_loss += loss.item()
 
         return total_loss / len(dataloader)
