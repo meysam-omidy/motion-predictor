@@ -103,8 +103,8 @@ class LossFunction(nn.Module):
         pred_boxes = preds[:, :, :4]
         target_boxes = targets[:, :, :4]
         cious = self.ciou(target_boxes, pred_boxes)
-        ious = self.iou(target_boxes, pred_boxes)
-        ious = torch.diagonal(ious, dim1=1, dim2=2)
+        # ious = self.iou(target_boxes, pred_boxes)
+        # ious = torch.diagonal(ious, dim1=1, dim2=2)
 
         # loss1 = nn.functional.smooth_l1_loss(torch.ones_like(ious), ious)
         loss1 = (1 - cious).mean()
@@ -112,6 +112,7 @@ class LossFunction(nn.Module):
         
         target_cs = targets[:, :, 4]
         pred_cs = preds[:, :, 4]
-        loss3 = nn.functional.smooth_l1_loss(pred_cs, ious.detach())
+        loss3 = nn.functional.smooth_l1_loss(pred_cs, cious.detach())
+        # loss3 = nn.functional.smooth_l1_loss(pred_cs, ious.detach())
         
         return self.loss1_coeff * loss1 + self.loss2_coeff * loss2 + self.loss3_coeff * loss3

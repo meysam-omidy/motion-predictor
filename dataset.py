@@ -85,7 +85,7 @@ class GTSequenceDataset(Dataset):
         df.columns = ['frame', 'id', 'x', 'y', 'w', 'h', 'conf', 'class', 'visibility']
 
         for obj_id, obj_df in df.groupby('id'):
-            print(seq_path, obj_id)
+            # print(seq_path, obj_id)
             obj_df = obj_df.sort_values('frame')
             obj_df['x'] += obj_df['w'] / 2
             obj_df['y'] += obj_df['h'] / 2
