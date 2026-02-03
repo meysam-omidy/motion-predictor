@@ -210,3 +210,4 @@ code*.ipynb
 *.md
 data2
 pretrained
+phase1
