@@ -78,11 +78,27 @@ class MotionTransformer(nn.Module):
         mask[:, :src_size] = 0
         return mask.bool()
 
-    def forward(self, src, trg):
+    def forward(self, src, trg, src_key_padding_mask=None):
+        """
+        src_key_padding_mask: optional (B, src_len) bool, True where src rows are padding
+        (e.g. few-shot left padding). Target side is never masked as padding here.
+        """
+        b, src_len, _ = src.shape
         input_tensor = torch.cat([src, trg], dim=1)
         enc_emb = self.pos_enc(self.in_fc(input_tensor) * math.sqrt(self.d_model))
         mask = self._mask(src.size(1), trg.size(1), input_tensor.device)
-        out = self.transformer.forward(enc_emb, mask=mask)
+        pad = None
+        if src_key_padding_mask is not None:
+            pad = torch.zeros(
+                b, src_len + trg.size(1), dtype=torch.bool, device=input_tensor.device
+            )
+            pad[:, :src_len] = src_key_padding_mask
+        if pad is None:
+            out = self.transformer.forward(enc_emb, mask=mask)
+        else:
+            out = self.transformer.forward(
+                enc_emb, mask=mask, src_key_padding_mask=pad
+            )
         pred = self.out_fc(out[:, -trg.size(1):, :])
         return torch.concat([
             trg[:, :, :4] + pred[:, :, :4],

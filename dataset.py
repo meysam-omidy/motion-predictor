@@ -121,22 +121,13 @@ class GTSequenceDataset(Dataset):
                 
                 frames = frames_total[i:i+seq_total_len]
 
-                # if random_drop_prob is not None:
-                #     # Randomly drop frames to simulate missing detections/occlusions
-                #     # This makes the model robust to missing observations
-                #     drop_mask = np.random.random(size=len(seq_enhanced)) < random_drop_prob
-                    
-                #     # Set confidence to 0 for dropped frames (simulating missed detection)
-                #     seq_enhanced[drop_mask, -1] = 0
-                    
-                #     # Optionally zero out bbox coordinates for dropped frames
-                #     # This simulates complete detection failure
-                #     seq_enhanced[drop_mask, :4] = 0
-                    
-                #     # If using motion features, also zero them out
-                #     if use_motion_features and seq_enhanced.shape[1] == 13:
-                #         seq_enhanced[drop_mask, 4:12] = 0
-                    
+                if random_drop_prob is not None and random_drop_prob > 0:
+                    drop_mask = np.random.random(size=len(seq_enhanced)) < random_drop_prob
+                    seq_enhanced[drop_mask, -1] = 0
+                    seq_enhanced[drop_mask, :4] = 0
+                    if use_motion_features and seq_enhanced.shape[1] >= 13:
+                        seq_enhanced[drop_mask, 4:12] = 0
+
                 if not random_jump:
                     if has_jump(frames[:seq_in_len]) or has_jump(frames[-seq_out_len:]):
                         continue
@@ -204,3 +195,10 @@ class GTSequenceDataset(Dataset):
         gt_source = self.gt_sources[idx]
         gt_target = self.gt_targets[idx]
         return torch.tensor(source), torch.tensor(target), torch.tensor(gt_source), torch.tensor(gt_target)
+
+
+def few_shot_padded_from_roots(**kwargs):
+    """Variable short context with left padding; see ``few_shot_motion_dataset.FewShotPaddedMotionDataset``."""
+    from few_shot_motion_dataset import FewShotPaddedMotionDataset
+
+    return FewShotPaddedMotionDataset.from_roots(**kwargs)
