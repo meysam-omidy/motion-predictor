@@ -533,10 +533,13 @@ if __name__ == "__main__":
     )
     p.add_argument("--output_dir", type=str, default="./eval/adaptive_kalman")
     p.add_argument("--val_path", type=str, default=None, help="Single generic val root")
-    p.add_argument("--mot17_val_path", type=str, default=None)
-    p.add_argument("--mot20_val_path", type=str, default=None)
-    p.add_argument("--dancetrack_val_path", type=str, default=None)
-    p.add_argument("--sportsmot_val_path", type=str, default=None)
+    p.add_argument("--mot17_val_path", type=str, default="C:/Projects/.Datasets/MOT17/val")
+    # p.add_argument("--mot20_val_path", type=str, default=None)
+    p.add_argument("--mot20_val_path", type=str, default="C:/Projects/.Datasets/MOT20/val")
+    # p.add_argument("--dancetrack_val_path", type=str, default=None)
+    p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
+    # p.add_argument("--sportsmot_val_path", type=str, default=None)
+    p.add_argument("--sportsmot_val_path", type=str, default="C:/Projects/.Datasets/SportsMOT/val")
 
     p.add_argument(
         "--use_ckpt_seq_config",
@@ -558,13 +561,13 @@ if __name__ == "__main__":
     p.add_argument("--random_drop_prob", type=float, default=0.2)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
 
-    p.add_argument("--model_type", type=str, default=None, choices=["transformer", "lstm"])
+    p.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "lstm"])
     p.add_argument("--conf_alpha", type=float, default=None)
     p.add_argument("--fixed_var", type=float, default=1e-3, help="Baseline fixed variance")
 
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--cpu", action="store_true")
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--cpu", action="store_false")
     p.add_argument("--plot", action="store_true", help="Save calibration/correlation plots")
 
     main(p.parse_args())
