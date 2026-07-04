@@ -1,0 +1,126 @@
+{
+  "checkpoint": "_tmp_eval_ckpt.pth",
+  "config": {
+    "checkpoint": "_tmp_eval_ckpt.pth",
+    "output_dir": "_tmp_eval_out",
+    "val_path": "data2/MOT17/val",
+    "mot17_val_path": null,
+    "mot20_val_path": null,
+    "dancetrack_val_path": null,
+    "sportsmot_val_path": null,
+    "seq_in_len": 10,
+    "seq_out_len": 5,
+    "seq_total_len": 15,
+    "steps": 20,
+    "noise_prob": 0.2,
+    "noise_coeff": 0.1,
+    "random_drop_prob": 0.2,
+    "max_gap_norm": 30.0,
+    "model_type": null,
+    "conf_alpha": null,
+    "fixed_var": 0.001,
+    "batch_size": 32,
+    "num_workers": 4,
+    "cpu": true,
+    "plot": false
+  },
+  "datasets": {
+    "VAL": {
+      "root": "data2/MOT17/val",
+      "n_samples": 6201,
+      "summary": {
+        "loss_total": 3.546839992493665,
+        "loss_innov": 1.1645533644832002,
+        "loss_r": 4.715340477826999,
+        "loss_q": 0.4923277869183793,
+        "nll_model": 1.1645533644832002,
+        "nll_fixed_var": -2.5296420879161006,
+        "nll_conf_r_only": 0.8924006588938467,
+        "calib_ratio": 6.2557575506645895e-06,
+        "mean_var_q": 0.6700940543058476,
+        "mean_var_r": 1.0505781018566727,
+        "mean_innov_sq": 1.0593991029864926e-05,
+        "nll_observed": 1.165509658058965,
+        "mean_var_q_observed": 0.669866819945752,
+        "nll_gap": 1.1611680916827871,
+        "mean_var_q_gap": 0.6709212094925042,
+        "n_steps": 24804,
+        "corr_r_score": 0.010801458757339715,
+        "corr_r_one_minus_score": -0.010801458777406837,
+        "corr_q_gap": -0.10946718473764175,
+        "corr_var_innov_sq": 0.007377080801349645
+      },
+      "checks": {
+        "beats_fixed_variance": false,
+        "beats_conf_r_baseline": false,
+        "calibration_ok": false,
+        "q_increases_with_gap": false,
+        "r_decreases_with_score": false,
+        "q_higher_in_gaps": true,
+        "score": "1/6"
+      },
+      "calibration_bins": [
+        {
+          "bin": 0,
+          "pred_var_mean": 1.0054678916931152,
+          "actual_sq_mean": 4.8230740503640845e-06,
+          "count": 9922
+        },
+        {
+          "bin": 1,
+          "pred_var_mean": 1.1752350330352783,
+          "actual_sq_mean": 9.46640193433268e-06,
+          "count": 9921
+        },
+        {
+          "bin": 2,
+          "pred_var_mean": 1.3412338495254517,
+          "actual_sq_mean": 1.629414691706188e-05,
+          "count": 9922
+        },
+        {
+          "bin": 3,
+          "pred_var_mean": 1.4347078800201416,
+          "actual_sq_mean": 1.3760769434156828e-05,
+          "count": 9921
+        },
+        {
+          "bin": 4,
+          "pred_var_mean": 1.516558289527893,
+          "actual_sq_mean": 9.388402759213932e-06,
+          "count": 9922
+        },
+        {
+          "bin": 5,
+          "pred_var_mean": 1.6212091445922852,
+          "actual_sq_mean": 8.58144812809769e-06,
+          "count": 9921
+        },
+        {
+          "bin": 6,
+          "pred_var_mean": 1.7250138521194458,
+          "actual_sq_mean": 6.250951628317125e-06,
+          "count": 9922
+        },
+        {
+          "bin": 7,
+          "pred_var_mean": 1.9038169384002686,
+          "actual_sq_mean": 5.18191336595919e-06,
+          "count": 9921
+        },
+        {
+          "bin": 8,
+          "pred_var_mean": 2.4740986824035645,
+          "actual_sq_mean": 2.164329453080427e-05,
+          "count": 9922
+        },
+        {
+          "bin": 9,
+          "pred_var_mean": 3.0093045234680176,
+          "actual_sq_mean": 1.0548964382905979e-05,
+          "count": 9922
+        }
+      ]
+    }
+  }
+}

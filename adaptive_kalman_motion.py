@@ -119,7 +119,10 @@ class AdaptiveKalmanLoss(nn.Module):
         loss_r = F.smooth_l1_loss(log_var_r, target_log_r)
 
         # Mild penalty when Q explodes on easy (high-confidence) steps
-        easy = trg_scores.clamp(0, 1).unsqueeze(-1)
+        scores = trg_scores.clamp(0, 1)
+        if scores.dim() == 2:
+            scores = scores.unsqueeze(-1)
+        easy = scores[..., :1]
         loss_q = (var_q * easy).mean()
 
         loss = (
