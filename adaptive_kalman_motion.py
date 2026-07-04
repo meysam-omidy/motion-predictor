@@ -118,8 +118,7 @@ class AdaptiveKalmanLoss(nn.Module):
         target_log_r = torch.log(meas_sq + 1e-6).expand_as(log_var_r)
         loss_r = F.smooth_l1_loss(log_var_r, target_log_r)
 
-        # Mild penalty when Q explodes on easy (high-confidence) steps
-        easy = trg_scores.clamp(0, 1).unsqueeze(-1)
+        easy = trg_scores.clamp(0, 1)
         loss_q = (var_q * easy).mean()
 
         loss = (
