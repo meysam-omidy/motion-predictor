@@ -134,29 +134,32 @@ def evaluate_batch(
         log_q, log_r = model(src, ctx)
 
     innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-    trg_scores = trg[:, 1:, SCORE_IDX : SCORE_IDX + 1]
+    trg_step = trg[:, 1:, :]
+    gt_step = gt_trg[:, 1:, :]
 
-    loss, loss_parts = criterion(log_q, log_r, innovations, src, gt_src, trg_scores)
+    loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step)
 
     var_q = softplus_var(log_q)
     var_r = softplus_var(log_r)
-    var_model = var_q + var_r
     innov_sq = innovations.pow(2)
 
-    nll_model = _log_2pi_nll(innovations, var_model).mean()
+    nll_model = _log_2pi_nll(innovations, var_q).mean()
     nll_fixed = _log_2pi_nll(
-        innovations, torch.full_like(var_model, fixed_var)
+        innovations, torch.full_like(var_q, fixed_var)
     ).mean()
 
-    log_r_prior = confidence_log_r_prior(trg_scores, alpha=conf_alpha)
-    var_conf_only = softplus_var(log_r_prior.expand_as(log_q)) + fixed_var * 0.01
+    log_r_prior = confidence_log_r_prior(trg_step[..., 12:13], alpha=conf_alpha)
+    var_conf_only = softplus_var(log_r_prior.expand_as(log_q))
     nll_conf_r = _log_2pi_nll(innovations, var_conf_only).mean()
 
-    # Calibration ratio: mean(actual sq innov) / mean(predicted var); ~1.0 is ideal
-    calib_ratio = (innov_sq.mean() / var_model.mean()).item()
-
-    observed = trg[:, 1:, OBSERVED_IDX] > 0.5
-    gap_len = trg[:, 1:, FRAMES_SINCE_IDX]
+    observed = trg_step[:, :, OBSERVED_IDX] > 0.5
+    gap = ~observed
+    calib_ratio = (
+        (innov_sq[gap.unsqueeze(-1).expand_as(innov_sq)].mean()
+         / var_q[gap.unsqueeze(-1).expand_as(var_q)].mean()).item()
+        if gap.any()
+        else float("nan")
+    )
 
     batch_metrics = {
         "loss_total": loss.item(),
@@ -168,26 +171,29 @@ def evaluate_batch(
         "mean_var_q": var_q.mean().item(),
         "mean_var_r": var_r.mean().item(),
         "mean_innov_sq": innov_sq.mean().item(),
+        "calib_q_gap": calib_ratio,
     }
 
     if observed.any():
+        obs_m = observed.unsqueeze(-1).expand_as(innovations)
         batch_metrics["nll_observed"] = (
-            _log_2pi_nll(innovations[observed], var_model[observed]).mean().item()
+            _log_2pi_nll(innovations[obs_m], var_q[obs_m]).mean().item()
         )
-        batch_metrics["mean_var_q_observed"] = var_q[observed].mean().item()
-    if (~observed).any():
+        batch_metrics["mean_var_r_obs"] = var_r[obs_m].mean().item()
+    if gap.any():
+        gap_m = gap.unsqueeze(-1).expand_as(innovations)
         batch_metrics["nll_gap"] = (
-            _log_2pi_nll(innovations[~observed], var_model[~observed]).mean().item()
+            _log_2pi_nll(innovations[gap_m], var_q[gap_m]).mean().item()
         )
-        batch_metrics["mean_var_q_gap"] = var_q[~observed].mean().item()
+        batch_metrics["mean_var_q_gap"] = var_q[gap_m].mean().item()
 
     arrays = {
         "innov_sq": innov_sq.reshape(-1).cpu().numpy(),
-        "var_total": var_model.reshape(-1).cpu().numpy(),
+        "var_total": var_q.reshape(-1).cpu().numpy(),
         "var_q": var_q.reshape(-1).cpu().numpy(),
         "var_r": var_r.reshape(-1).cpu().numpy(),
-        "scores": trg_scores.reshape(-1).cpu().numpy(),
-        "gap_len": gap_len.reshape(-1).cpu().numpy(),
+        "scores": trg_step[..., SCORE_IDX].reshape(-1).cpu().numpy(),
+        "gap_len": trg_step[:, :, FRAMES_SINCE_IDX].reshape(-1).cpu().numpy(),
         "observed": observed.reshape(-1).cpu().numpy().astype(bool),
     }
     return batch_metrics, arrays
@@ -261,8 +267,10 @@ def verdict(summary: dict) -> dict:
     checks["beats_fixed_variance"] = nll_m < nll_f
     checks["beats_conf_r_baseline"] = nll_m < nll_c
 
-    calib = summary.get("calib_ratio", 0.0)
-    checks["calibration_ok"] = 0.25 <= calib <= 4.0
+    calib = summary.get("calib_q_gap", summary.get("calib_ratio", 0.0))
+    checks["calibration_ok"] = (
+        calib == calib and 0.25 <= calib <= 4.0  # not NaN
+    )
 
     cq = summary.get("corr_q_gap", float("nan"))
     checks["q_increases_with_gap"] = not math.isnan(cq) and cq > 0.05
@@ -294,7 +302,7 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
           f"({'better' if checks.get('beats_fixed_variance') else 'worse'})")
     print(f"    vs conf-R only:    {summary.get('nll_conf_r_only', 0):.4f}  "
           f"({'better' if checks.get('beats_conf_r_baseline') else 'worse'})")
-    print(f"  Calibration ratio:   {summary.get('calib_ratio', 0):.3f}  "
+    print(f"  Calibration (Q,gap): {summary.get('calib_q_gap', summary.get('calib_ratio', float('nan'))):.3f}  "
           f"(~1.0 ideal; {'ok' if checks.get('calibration_ok') else 'check'})")
     print(f"  Mean var Q / R:      {summary.get('mean_var_q', 0):.2e} / "
           f"{summary.get('mean_var_r', 0):.2e}")
@@ -426,17 +434,14 @@ def main(args) -> None:
             "seq_out_len",
             "seq_total_len",
             "steps",
-            "noise_prob",
-            "noise_coeff",
-            "random_drop_prob",
             "max_gap_norm",
         ):
             if key in train_args:
                 setattr(args, key, train_args[key])
+        # Keep eval-specific augmentation (do not copy training drop/noise)
         print(
             f"Sequence config from checkpoint: "
-            f"in={args.seq_in_len}, out={args.seq_out_len}, total={args.seq_total_len}, "
-            f"drop={args.random_drop_prob}"
+            f"in={args.seq_in_len}, out={args.seq_out_len}, total={args.seq_total_len}"
         )
 
     val_roots: List[Tuple[str, str]] = []

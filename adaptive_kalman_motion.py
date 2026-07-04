@@ -29,15 +29,19 @@ def softplus_var(log_v: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
 
 
 def confidence_log_r_prior(
-    score: torch.Tensor, alpha: float = 2.0, floor: float = 1e-6
+    score: torch.Tensor,
+    alpha: float = 2.0,
+    base_log_var: float = -9.0,
 ) -> torch.Tensor:
     """
-    log R prior matching OC-SORT conf-R: R ∝ exp(alpha * (1 - score)).
-    score: (..., 1) in [0, 1].
-    Returns log prior with same trailing shape, broadcastable to 4 bbox dims.
+    Log-variance prior for normalized xywh (typical det. error var ~ 1e-4).
+
+    Matches OC-SORT conf-R shape: low score -> larger R.
+    Prior is **additive in log-space** (not exp(2*(1-s)) which is ~O(1) and
+    far too large for [0,1]-normalized boxes).
     """
     s = score.clamp(0.0, 1.0)
-    return torch.log(torch.exp(alpha * (1.0 - s)) + floor)
+    return base_log_var + alpha * (1.0 - s)
 
 
 def constant_velocity_predict(
@@ -69,12 +73,32 @@ def build_cv_innovations(
     return torch.stack(innovations, dim=1)
 
 
+def _log_var_match(pred_var: torch.Tensor, target_var: torch.Tensor) -> torch.Tensor:
+    eps = 1e-8
+    return F.smooth_l1_loss(
+        torch.log(pred_var.clamp(min=eps)),
+        torch.log(target_var.clamp(min=eps)),
+    )
+
+
+def _gaussian_nll(
+    innovations: torch.Tensor, var: torch.Tensor, log_2pi: float
+) -> torch.Tensor:
+    return 0.5 * (
+        innovations.pow(2) / var + torch.log(var.clamp(min=1e-8)) + log_2pi
+    )
+
+
 class AdaptiveKalmanLoss(nn.Module):
     """
-    Innovation NLL (heteroscedastic) + R supervision + optional Q regularization.
+    Context-split Kalman noise loss (thesis-aligned):
 
-    Total predicted variance for the innovation combines process and measurement
-    uncertainty: var = var_q + var_r (diagonal, per bbox dimension).
+    - **Q / innovation NLL:** CV prediction error is explained by process noise Q
+      (not Q+R — that let Q collapse to the softplus floor).
+    - **R supervision:** on observed steps only, match var_r to per-step detector
+      error (noisy box vs GT), in log-variance space after softplus.
+    - **Q gap supervision:** on dropped/missing steps, match var_q to |innovation|².
+    - **Q easy penalty:** lightly penalize large Q on high-confidence observed steps.
     """
 
     _LOG_2PI = math.log(2 * math.pi)
@@ -83,78 +107,125 @@ class AdaptiveKalmanLoss(nn.Module):
         self,
         innovation_coeff: float = 1.0,
         r_supervise_coeff: float = 0.5,
-        q_smooth_coeff: float = 0.05,
+        q_gap_coeff: float = 0.3,
+        q_easy_coeff: float = 0.01,
         conf_alpha: float = 2.0,
+        var_floor: float = 1e-6,
+        norm_var_floor: float = 1e-4,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
         self.r_supervise_coeff = r_supervise_coeff
-        self.q_smooth_coeff = q_smooth_coeff
+        self.q_gap_coeff = q_gap_coeff
+        self.q_easy_coeff = q_easy_coeff
         self.conf_alpha = conf_alpha
+        self.var_floor = var_floor
+        self.norm_var_floor = norm_var_floor
 
     def forward(
         self,
         log_var_q: torch.Tensor,
         log_var_r: torch.Tensor,
         innovations: torch.Tensor,
-        src: torch.Tensor,
-        gt_src: torch.Tensor,
-        trg_scores: torch.Tensor,
+        trg: torch.Tensor,
+        gt_trg: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        var_q = softplus_var(log_var_q)
-        var_r = softplus_var(log_var_r)
-        var_total = var_q + var_r
+        var_q = softplus_var(log_var_q, floor=self.var_floor)
+        var_r = softplus_var(log_var_r, floor=self.var_floor)
 
-        nll = 0.5 * (
-            innovations.pow(2) / var_total
-            + torch.log(var_total)
-            + self._LOG_2PI
+        innov_sq = innovations.pow(2).clamp(min=self.var_floor)
+        # Normalized xywh: do not let NLL reward var below ~1e-4 (typical det. scale)
+        var_q_nll = torch.maximum(var_q, innov_sq.detach())
+        var_q_nll = torch.maximum(
+            var_q_nll, torch.full_like(var_q_nll, self.norm_var_floor)
         )
-        loss_innov = nll.mean()
 
-        meas_sq = (src[..., :4] - gt_src[..., :4]).pow(2).mean(
-            dim=(1, 2), keepdim=True
-        )
-        target_log_r = torch.log(meas_sq + 1e-6).expand_as(log_var_r)
-        loss_r = F.smooth_l1_loss(log_var_r, target_log_r)
+        # Q explains CV innovations (predict / process step)
+        loss_innov = _gaussian_nll(innovations, var_q_nll, self._LOG_2PI).mean()
+        scores = trg[..., 12:13].clamp(0.0, 1.0)
+        observed = trg[..., 14:15] > 0.5
+        gap = ~observed
 
-        # Mild penalty when Q explodes on easy (high-confidence) steps
-        scores = trg_scores.clamp(0, 1)
-        if scores.dim() == 2:
-            scores = scores.unsqueeze(-1)
-        easy = scores[..., :1]
-        loss_q = (var_q * easy).mean()
+        # R: per-step detector error on observed frames
+        meas_sq = (trg[..., :4] - gt_trg[..., :4]).pow(2).clamp(min=self.var_floor)
+        if observed.any():
+            loss_r = _log_var_match(
+                var_r[observed.expand_as(var_r)], meas_sq[observed.expand_as(meas_sq)]
+            )
+        else:
+            loss_r = innovations.new_tensor(0.0)
+
+        # Q: on gap frames, process noise should scale with innovation magnitude
+        if gap.any():
+            gap_var_q = var_q[gap.expand_as(var_q)]
+            gap_target = torch.maximum(
+                innov_sq[gap.expand_as(innov_sq)],
+                torch.full_like(innov_sq[gap.expand_as(innov_sq)], self.norm_var_floor),
+            )
+            loss_q_gap = _log_var_match(gap_var_q, gap_target)
+        else:
+            loss_q_gap = innovations.new_tensor(0.0)
+
+        # Keep Q small when we have a confident observation
+        easy = scores * observed.float()
+        loss_q_easy = (var_q * easy).mean()
 
         loss = (
             self.innovation_coeff * loss_innov
             + self.r_supervise_coeff * loss_r
-            + self.q_smooth_coeff * loss_q
+            + self.q_gap_coeff * loss_q_gap
+            + self.q_easy_coeff * loss_q_easy
         )
-        metrics = {
-            "loss_innov": float(loss_innov.detach()),
-            "loss_r": float(loss_r.detach()),
-            "loss_q": float(loss_q.detach()),
-        }
+
+        with torch.no_grad():
+            calib_q = (
+                (innov_sq[gap.expand_as(innov_sq)].mean() / var_q[gap.expand_as(var_q)].mean())
+                if gap.any()
+                else innovations.new_tensor(float("nan"))
+            )
+            metrics = {
+                "loss_innov": float(loss_innov),
+                "loss_r": float(loss_r),
+                "loss_q_gap": float(loss_q_gap),
+                "loss_q_easy": float(loss_q_easy),
+                "mean_var_q": float(var_q.mean()),
+                "mean_var_r": float(var_r.mean()),
+                "mean_innov_sq": float(innov_sq.mean()),
+                "calib_q_gap": float(calib_q),
+                "frac_gap": float(gap.float().mean()),
+            }
+            if gap.any():
+                metrics["mean_var_q_gap"] = float(var_q[gap.expand_as(var_q)].mean())
+            if observed.any():
+                metrics["mean_var_r_obs"] = float(var_r[observed.expand_as(var_r)].mean())
+
         return loss, metrics
 
 
 class _AdaptiveKalmanHead(nn.Module):
     """Shared Q/R output heads with confidence-R prior on R."""
 
-    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0):
+    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0, q_init_bias: float = -9.0):
         super().__init__()
         self.conf_alpha = conf_alpha
         self.q_head = nn.Linear(hidden_dim, 4)
         self.r_residual_head = nn.Linear(hidden_dim, 4)
         nn.init.zeros_(self.r_residual_head.weight)
         nn.init.zeros_(self.r_residual_head.bias)
+        # Avoid Q collapsing to softplus floor at init (softplus(-5) ~ 0.007)
+        nn.init.constant_(self.q_head.bias, q_init_bias)
+        nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
 
     def forward(
         self, hidden: torch.Tensor, scores: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_var_q = self.q_head(hidden)
         log_r_prior = confidence_log_r_prior(scores, alpha=self.conf_alpha)
-        log_var_r = log_r_prior + self.r_residual_head(hidden)
+        prior_var = softplus_var(log_r_prior)
+        # Residual is additive in variance space (keeps R >= conf-R prior)
+        delta_r = F.softplus(self.r_residual_head(hidden))
+        var_r = prior_var + delta_r
+        log_var_r = torch.log(var_r.clamp(min=1e-8))
         return log_var_q, log_var_r
 
 
@@ -272,7 +343,7 @@ class AdaptiveKalmanTransformer(nn.Module):
     ) -> Tuple[float, dict]:
         self.train()
         total = 0.0
-        agg = {"loss_innov": 0.0, "loss_r": 0.0, "loss_q": 0.0}
+        agg: dict = {}
         n = max(len(dataloader), 1)
         for src, trg, gt_src, gt_trg in dataloader:
             src = src.to(device)
@@ -285,14 +356,14 @@ class AdaptiveKalmanTransformer(nn.Module):
             log_q, log_r = self.forward(src, ctx)
             innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
             loss, metrics = criterion(
-                log_q, log_r, innovations, src, gt_src, trg[:, 1:, 12:13]
+                log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
             )
             loss.backward()
             nn.utils.clip_grad_norm_(self.parameters(), 1.0)
             optimizer.step()
             total += loss.item()
-            for k in agg:
-                agg[k] += metrics[k]
+            for k, v in metrics.items():
+                agg[k] = agg.get(k, 0.0) + v
         return total / n, {k: v / n for k, v in agg.items()}
 
     def evaluate(
@@ -303,7 +374,7 @@ class AdaptiveKalmanTransformer(nn.Module):
     ) -> Tuple[float, dict]:
         self.eval()
         total = 0.0
-        agg = {"loss_innov": 0.0, "loss_r": 0.0, "loss_q": 0.0}
+        agg: dict = {}
         n = max(len(dataloader), 1)
         with torch.no_grad():
             for src, trg, gt_src, gt_trg in dataloader:
@@ -314,11 +385,11 @@ class AdaptiveKalmanTransformer(nn.Module):
                 log_q, log_r = self.forward(src, trg[:, :-1, :])
                 innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
                 loss, metrics = criterion(
-                    log_q, log_r, innovations, src, gt_src, trg[:, 1:, 12:13]
+                    log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
                 )
                 total += loss.item()
-                for k in agg:
-                    agg[k] += metrics[k]
+                for k, v in metrics.items():
+                    agg[k] = agg.get(k, 0.0) + v
         return total / n, {k: v / n for k, v in agg.items()}
 
     def save_weight(self, path: str) -> None:
@@ -415,7 +486,7 @@ class AdaptiveKalmanLSTM(nn.Module):
     ) -> Tuple[float, dict]:
         self.train()
         total = 0.0
-        agg = {"loss_innov": 0.0, "loss_r": 0.0, "loss_q": 0.0}
+        agg: dict = {}
         n = max(len(dataloader), 1)
         for src, trg, gt_src, gt_trg in dataloader:
             src = src.to(device)
@@ -426,14 +497,14 @@ class AdaptiveKalmanLSTM(nn.Module):
             log_q, log_r = self.forward(src, trg[:, :-1, :])
             innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
             loss, metrics = criterion(
-                log_q, log_r, innovations, src, gt_src, trg[:, 1:, 12:13]
+                log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
             )
             loss.backward()
             nn.utils.clip_grad_norm_(self.parameters(), 1.0)
             optimizer.step()
             total += loss.item()
-            for k in agg:
-                agg[k] += metrics[k]
+            for k, v in metrics.items():
+                agg[k] = agg.get(k, 0.0) + v
         return total / n, {k: v / n for k, v in agg.items()}
 
     def evaluate(
@@ -444,7 +515,7 @@ class AdaptiveKalmanLSTM(nn.Module):
     ) -> Tuple[float, dict]:
         self.eval()
         total = 0.0
-        agg = {"loss_innov": 0.0, "loss_r": 0.0, "loss_q": 0.0}
+        agg: dict = {}
         n = max(len(dataloader), 1)
         with torch.no_grad():
             for src, trg, gt_src, gt_trg in dataloader:
@@ -457,11 +528,11 @@ class AdaptiveKalmanLSTM(nn.Module):
                 )
                 innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
                 loss, metrics = criterion(
-                    log_q, log_r, innovations, src, gt_src, trg[:, 1:, 12:13]
+                    log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
                 )
                 total += loss.item()
                 for k in agg:
-                    agg[k] += metrics[k]
+                    agg[k] += metrics.get(k, 0.0)
         return total / n, {k: v / n for k, v in agg.items()}
 
     def save_weight(self, path: str) -> None:

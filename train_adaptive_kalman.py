@@ -137,7 +137,8 @@ def main(args):
     criterion = AdaptiveKalmanLoss(
         innovation_coeff=args.innovation_coeff,
         r_supervise_coeff=args.r_supervise_coeff,
-        q_smooth_coeff=args.q_smooth_coeff,
+        q_gap_coeff=args.q_gap_coeff,
+        q_easy_coeff=args.q_easy_coeff,
         conf_alpha=args.conf_alpha,
     )
     optimizer = AdamW(
@@ -173,10 +174,11 @@ def main(args):
         lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch}/{args.epochs} | "
-            f"train {train_loss:.4f} (innov {train_metrics['loss_innov']:.4f}, "
-            f"r {train_metrics['loss_r']:.4f}) | "
-            f"val {val_loss:.4f} (innov {val_metrics['loss_innov']:.4f}, "
-            f"r {val_metrics['loss_r']:.4f}) | lr {lr:.2e} | {time.time()-t0:.1f}s"
+            f"train {train_loss:.4f} (innov {train_metrics.get('loss_innov', 0):.4f}, "
+            f"r {train_metrics.get('loss_r', 0):.4f}, q_gap {train_metrics.get('loss_q_gap', 0):.4f}) | "
+            f"val {val_loss:.4f} (innov {val_metrics.get('loss_innov', 0):.4f}, "
+            f"var_q {val_metrics.get('mean_var_q', 0):.2e}, calib_q {val_metrics.get('calib_q_gap', float('nan')):.2f}) | "
+            f"lr {lr:.2e} | {time.time()-t0:.1f}s"
         )
 
         if val_loss < best_val:
@@ -202,10 +204,12 @@ def main(args):
                 break
 
         if epoch % args.save_every == 0:
-            torch.save(
-                {"epoch": epoch, "history": history, "args": vars(args)},
-                save_dir / f"checkpoint_epoch_{epoch}.json",
-            )
+            with open(save_dir / f"checkpoint_epoch_{epoch}.json", "w") as f:
+                json.dump(
+                    {"epoch": epoch, "history": history, "args": vars(args)},
+                    f,
+                    indent=2,
+                )
 
     with open(save_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
@@ -263,7 +267,8 @@ if __name__ == "__main__":
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
     p.add_argument("--r_supervise_coeff", type=float, default=0.5)
-    p.add_argument("--q_smooth_coeff", type=float, default=0.05)
+    p.add_argument("--q_gap_coeff", type=float, default=0.3)
+    p.add_argument("--q_easy_coeff", type=float, default=0.01)
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
     p.add_argument("--batch_size", type=int, default=64)
