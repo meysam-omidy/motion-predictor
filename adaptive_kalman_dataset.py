@@ -65,7 +65,7 @@ def _enhance_sequence(
     return seq_enhanced, seq_enhanced_gt
 
 
-class AdaptiveKalmanDataset(Dataset):
+class  AdaptiveKalmanDataset(Dataset):
     """MOT-style sliding windows with gap context for Q/R-only training."""
 
     @staticmethod

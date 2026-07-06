@@ -1,0 +1,72 @@
+{
+  "epoch": 5,
+  "history": {
+    "train_loss": [
+      -1.3432639554638037,
+      -1.4664499730199247,
+      -1.4665063793187614,
+      -1.4665090927219653,
+      -1.4665240407972546
+    ],
+    "val_loss": [
+      -1.4679592384232416,
+      -1.4680746321876843,
+      -1.4680989517105951,
+      -1.4681078929592062,
+      -1.468111706552682
+    ],
+    "val_metrics": [
+      {},
+      {},
+      {},
+      {},
+      {}
+    ]
+  },
+  "args": {
+    "mot17_train_path": "C:/Projects/.Datasets/MOT17/train",
+    "mot20_train_path": "C:/Projects/.Datasets/MOT20/train",
+    "dancetrack_train_path": "C:/Projects/.Datasets/DanceTrack/train",
+    "sportsmot_train_path": "C:/Projects/.Datasets/SportsMOT/train",
+    "mot17_val_path": "C:/Projects/.Datasets/MOT17/val",
+    "mot20_val_path": "C:/Projects/.Datasets/MOT20/val",
+    "dancetrack_val_path": "C:/Projects/.Datasets/DanceTrack/val",
+    "sportsmot_val_path": "C:/Projects/.Datasets/SportsMOT/val",
+    "seq_in_len": 30,
+    "seq_out_len": 20,
+    "seq_total_len": 50,
+    "steps": 4,
+    "random_jump": true,
+    "noise_prob": 0,
+    "noise_coeff": 0.1,
+    "random_drop_prob": 0,
+    "val_noise_prob": 0,
+    "val_noise_coeff": 0.1,
+    "val_random_drop_prob": 0,
+    "max_gap_norm": 30.0,
+    "dancetrack_weight": 1,
+    "model_type": "lstm",
+    "d_model": 256,
+    "nhead": 8,
+    "num_layers": 6,
+    "dim_ff": 1024,
+    "dropout": 0.1,
+    "lstm_hidden_dim": 256,
+    "lstm_num_layers": 1,
+    "teacher_forcing_ratio": 1,
+    "innovation_coeff": 1.0,
+    "r_supervise_coeff": 0.5,
+    "q_gap_coeff": 0.3,
+    "q_easy_coeff": 0.01,
+    "conf_alpha": 2.0,
+    "batch_size": 256,
+    "epochs": 80,
+    "lr": 0.0005,
+    "weight_decay": 0.0001,
+    "patience": 15,
+    "seed": 42,
+    "num_workers": 0,
+    "save_dir": "./checkpoints/adaptive_kalman_nn",
+    "save_every": 5
+  }
+}
