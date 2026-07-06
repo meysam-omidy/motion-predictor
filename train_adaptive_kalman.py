@@ -156,7 +156,15 @@ def main(args):
 
     best_val = float("inf")
     patience = 0
-    history = {"train_loss": [], "val_loss": [], "val_metrics": []}
+    history = {"train_loss": [], "val_loss": [], "train_metrics": [], "val_metrics": []}
+
+    if args.noise_prob <= 0 and args.random_drop_prob <= 0:
+        print(
+            "WARNING: noise_prob and random_drop_prob are both 0. "
+            "Training uses clean GT with no detector noise or occlusion gaps — "
+            "Q/R heads cannot learn meaningful heteroscedastic noise. "
+            "Use --noise_prob 0.3 --random_drop_prob 0.3 (defaults) for MOT training."
+        )
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -170,6 +178,7 @@ def main(args):
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_metrics"].append(train_metrics)
         history["val_metrics"].append(val_metrics)
 
         lr = optimizer.param_groups[0]["lr"]

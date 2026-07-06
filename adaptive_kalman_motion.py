@@ -531,8 +531,8 @@ class AdaptiveKalmanLSTM(nn.Module):
                     log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
                 )
                 total += loss.item()
-                for k in agg:
-                    agg[k] += metrics.get(k, 0.0)
+                for k, v in metrics.items():
+                    agg[k] = agg.get(k, 0.0) + v
         return total / n, {k: v / n for k, v in agg.items()}
 
     def save_weight(self, path: str) -> None:
