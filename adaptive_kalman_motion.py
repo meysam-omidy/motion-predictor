@@ -111,7 +111,7 @@ class AdaptiveKalmanLoss(nn.Module):
         q_easy_coeff: float = 0.01,
         conf_alpha: float = 2.0,
         var_floor: float = 1e-6,
-        norm_var_floor: float = 1e-4,
+        norm_var_floor: float = 1e-5,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
@@ -134,11 +134,8 @@ class AdaptiveKalmanLoss(nn.Module):
         var_r = softplus_var(log_var_r, floor=self.var_floor)
 
         innov_sq = innovations.pow(2).clamp(min=self.var_floor)
-        # Normalized xywh: do not let NLL reward var below ~1e-4 (typical det. scale)
-        var_q_nll = torch.maximum(var_q, innov_sq.detach())
-        var_q_nll = torch.maximum(
-            var_q_nll, torch.full_like(var_q_nll, self.norm_var_floor)
-        )
+        # Additive floor keeps gradients on var_q (max() was freezing Q at ~1e-4)
+        var_q_nll = var_q + self.norm_var_floor
 
         # Q explains CV innovations (predict / process step)
         loss_innov = _gaussian_nll(innovations, var_q_nll, self._LOG_2PI).mean()
@@ -146,22 +143,22 @@ class AdaptiveKalmanLoss(nn.Module):
         observed = trg[..., 14:15] > 0.5
         gap = ~observed
 
-        # R: per-step detector error on observed frames
+        # R: only where detector noise exists (skip clean frames — meas_sq≈0)
         meas_sq = (trg[..., :4] - gt_trg[..., :4]).pow(2).clamp(min=self.var_floor)
-        if observed.any():
+        per_step_meas = meas_sq.max(dim=-1, keepdim=True).values
+        has_det_noise = per_step_meas > (self.var_floor * 100)
+        r_mask = observed & has_det_noise
+        if r_mask.any():
             loss_r = _log_var_match(
-                var_r[observed.expand_as(var_r)], meas_sq[observed.expand_as(meas_sq)]
+                var_r[r_mask.expand_as(var_r)], meas_sq[r_mask.expand_as(meas_sq)]
             )
         else:
             loss_r = innovations.new_tensor(0.0)
 
-        # Q: on gap frames, process noise should scale with innovation magnitude
+        # Q: on gap frames, match to actual innovation² (no artificial 1e-4 floor)
         if gap.any():
             gap_var_q = var_q[gap.expand_as(var_q)]
-            gap_target = torch.maximum(
-                innov_sq[gap.expand_as(innov_sq)],
-                torch.full_like(innov_sq[gap.expand_as(innov_sq)], self.norm_var_floor),
-            )
+            gap_target = innov_sq[gap.expand_as(innov_sq)]
             loss_q_gap = _log_var_match(gap_var_q, gap_target)
         else:
             loss_q_gap = innovations.new_tensor(0.0)
@@ -193,6 +190,7 @@ class AdaptiveKalmanLoss(nn.Module):
                 "mean_innov_sq": float(innov_sq.mean()),
                 "calib_q_gap": float(calib_q),
                 "frac_gap": float(gap.float().mean()),
+                "frac_r_supervised": float(r_mask.float().mean()),
             }
             if gap.any():
                 metrics["mean_var_q_gap"] = float(var_q[gap.expand_as(var_q)].mean())
