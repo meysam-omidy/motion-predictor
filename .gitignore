@@ -211,3 +211,5 @@ code*.ipynb
 data2
 pretrained
 phase1
+
+checkpoints
