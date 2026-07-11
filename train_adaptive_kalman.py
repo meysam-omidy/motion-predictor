@@ -63,7 +63,8 @@ def build_datasets(args):
         seq_out_len=args.seq_out_len,
         seq_total_len=args.seq_total_len,
         steps=args.steps,
-        random_jump=args.random_jump,
+        random_jump=False,
+        # random_jump=args.random_jump,
         noise_prob=args.noise_prob,
         noise_coeff=args.noise_coeff,
         random_drop_prob=args.random_drop_prob,
@@ -231,19 +232,33 @@ if __name__ == "__main__":
         description="Train adaptive Kalman Q/R motion predictor (thesis model)"
     )
 
-    p.add_argument("--mot17_train_path", type=str, default=None)
+    p.add_argument("--mot17_train_path", type=str, default="C:/Projects/.Datasets/MOT17/train")
     p.add_argument("--mot20_train_path", type=str, default=None)
+    # p.add_argument("--mot20_train_path", type=str, default="C:/Projects/.Datasets/MOT20/train")
     p.add_argument("--dancetrack_train_path", type=str, default=None)
+    # p.add_argument("--dancetrack_train_path", type=str, default="C:/Projects/.Datasets/DanceTrack/train")
     p.add_argument("--sportsmot_train_path", type=str, default=None)
-    p.add_argument("--mot17_val_path", type=str, default=None)
+    # p.add_argument("--sportsmot_train_path", type=str, default="C:/Projects/.Datasets/SportsMOT/train")
+    p.add_argument("--mot17_val_path", type=str, default="C:/Projects/.Datasets/MOT17/val")
     p.add_argument("--mot20_val_path", type=str, default=None)
+    # p.add_argument("--mot20_val_path", type=str, default="C:/Projects/.Datasets/MOT20/val")
     p.add_argument("--dancetrack_val_path", type=str, default=None)
+    # p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
     p.add_argument("--sportsmot_val_path", type=str, default=None)
+    # p.add_argument("--sportsmot_val_path", type=str, default="C:/Projects/.Datasets/SportsMOT/val")
 
     p.add_argument("--seq_in_len", type=int, default=30)
-    p.add_argument("--seq_out_len", type=int, default=10)
-    p.add_argument("--seq_total_len", type=int, default=40)
+    p.add_argument("--seq_out_len", type=int, default=20)
+    p.add_argument("--seq_total_len", type=int, default=50)
     p.add_argument("--steps", type=int, default=4)
+    # p.add_argument("--random_jump", action="store_false")
+    # p.add_argument("--noise_prob", type=float, default=0)
+    # p.add_argument("--noise_coeff", type=float, default=0.1)
+    # p.add_argument("--random_drop_prob", type=float, default=0)
+    # p.add_argument("--val_noise_prob", type=float, default=0)
+    # p.add_argument("--val_noise_coeff", type=float, default=0.1)
+    # p.add_argument("--val_random_drop_prob", type=float, default=0)
+    # p.add_argument("--max_gap_norm", type=float, default=30.0)
     p.add_argument("--random_jump", action="store_true")
     p.add_argument("--noise_prob", type=float, default=0.3)
     p.add_argument("--noise_coeff", type=float, default=0.1)
@@ -263,26 +278,26 @@ if __name__ == "__main__":
     p.add_argument("--d_model", type=int, default=256)
     p.add_argument("--nhead", type=int, default=8)
     p.add_argument("--num_layers", type=int, default=6)
-    p.add_argument("--dim_ff", type=int, default=1024)
+    p.add_argument("--dim_ff", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lstm_hidden_dim", type=int, default=256)
-    p.add_argument("--lstm_num_layers", type=int, default=2)
-    p.add_argument("--teacher_forcing_ratio", type=float, default=0.5)
+    p.add_argument("--lstm_num_layers", type=int, default=1)
+    p.add_argument("--teacher_forcing_ratio", type=float, default=1)
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
     p.add_argument("--r_supervise_coeff", type=float, default=0.5)
-    p.add_argument("--q_gap_coeff", type=float, default=0.3)
+    p.add_argument("--q_gap_coeff", type=float, default=1.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--patience", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman")
-    p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_nn")
+    p.add_argument("--save_every", type=int, default=5)
 
     main(p.parse_args())

@@ -20,13 +20,68 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from dataset import GTSequenceDataset, batch_iou, has_jump
-
-
 FEATURE_DIM = 15
 SCORE_IDX = 12
 FRAMES_SINCE_IDX = 13
 OBSERVED_IDX = 14
+
+
+def _has_jump(seq):
+    return not ((seq[-1]- seq[0] + 1) == len(seq))
+
+
+def _xywh_to_tlbr(bbox:np.ndarray) -> np.ndarray:
+    o = np.zeros_like(bbox, dtype=float)
+    o[..., 0] = bbox[..., 0] - bbox[..., 2] / 2
+    o[..., 1] = bbox[..., 1] - bbox[..., 3] / 2
+    o[..., 2] = bbox[..., 0] + bbox[..., 2] / 2
+    o[..., 3] = bbox[..., 1] + bbox[..., 3] / 2
+    return o
+
+
+def _batch_iou(bbox1, bbox2):
+    bb1 = _xywh_to_tlbr(bbox1)
+    bb2 = _xywh_to_tlbr(bbox2)
+    bb1 = np.expand_dims(bb1, 1)
+    bb2 = np.expand_dims(bb2, 0)
+    xx1 = np.maximum(bb1[..., 0], bb2[..., 0])
+    yy1 = np.maximum(bb1[..., 1], bb2[..., 1])
+    xx2 = np.minimum(bb1[..., 2], bb2[..., 2])
+    yy2 = np.minimum(bb1[..., 3], bb2[..., 3])
+    w = np.maximum(0., xx2 - xx1)
+    h = np.maximum(0., yy2 - yy1)
+    wh = w * h
+    o = wh / ((bb1[..., 2] - bb1[..., 0]) * (bb1[..., 3] - bb1[..., 1])                                      
+        + (bb2[..., 2] - bb2[..., 0]) * (bb2[..., 3] - bb2[..., 1]) - wh)                                              
+    return(o) 
+
+
+def _compute_motion_features(bboxes):
+    """
+    Compute velocity and acceleration features for better motion modeling.
+    Returns enhanced features: [x, y, w, h, vx, vy, vw, vh, ax, ay, aw, ah]
+    
+    Note: First frame has zero velocity, first two frames have zero acceleration.
+    This is correct as we don't have previous frames to compute derivatives.
+    """
+    bboxes = copy(bboxes)
+    n = len(bboxes)
+    enhanced = np.zeros((n, 12))
+    enhanced[:, :4] = bboxes
+    
+    # Velocity (first-order difference)
+    if n > 1:
+        velocity = np.diff(bboxes, axis=0)
+        enhanced[1:, 4:8] = velocity
+        # First frame velocity = 0 (no previous frame)
+        
+    # Acceleration (second-order difference)
+    if n > 2:
+        acceleration = np.diff(velocity, axis=0)
+        enhanced[2:, 8:12] = acceleration
+        # First two frames acceleration = 0 (need at least 3 frames)
+        
+    return enhanced
 
 
 def _attach_gap_features(seq_enhanced: np.ndarray, max_gap_norm: float = 30.0) -> None:
@@ -52,20 +107,20 @@ def _enhance_sequence(
 ) -> Tuple[np.ndarray, np.ndarray]:
     if use_motion_features:
         seq_enhanced = np.zeros((len(seq), FEATURE_DIM), dtype=np.float32)
-        seq_enhanced[:, :12] = GTSequenceDataset.compute_motion_features(seq_noised)
+        seq_enhanced[:, :12] = _compute_motion_features(seq_noised)
         seq_enhanced_gt = np.zeros((len(seq), FEATURE_DIM), dtype=np.float32)
-        seq_enhanced_gt[:, :12] = GTSequenceDataset.compute_motion_features(seq)
+        seq_enhanced_gt[:, :12] = _compute_motion_features(seq)
     else:
         raise ValueError("AdaptiveKalmanDataset requires use_motion_features=True")
 
-    seq_enhanced[:, SCORE_IDX] = np.diag(batch_iou(seq, seq_noised))
+    seq_enhanced[:, SCORE_IDX] = np.diag(_batch_iou(seq, seq_noised))
     seq_enhanced_gt[:, SCORE_IDX] = 1.0
     _attach_gap_features(seq_enhanced, max_gap_norm)
     _attach_gap_features(seq_enhanced_gt, max_gap_norm)
     return seq_enhanced, seq_enhanced_gt
 
 
-class AdaptiveKalmanDataset(Dataset):
+class  AdaptiveKalmanDataset(Dataset):
     """MOT-style sliding windows with gap context for Q/R-only training."""
 
     @staticmethod
@@ -148,7 +203,7 @@ class AdaptiveKalmanDataset(Dataset):
                 frames = frames_total[i : i + seq_total_len]
 
                 if not random_jump:
-                    if has_jump(frames[:seq_in_len]) or has_jump(
+                    if _has_jump(frames[:seq_in_len]) or _has_jump(
                         frames[-seq_out_len:]
                     ):
                         continue
@@ -161,9 +216,9 @@ class AdaptiveKalmanDataset(Dataset):
                     index_2 = random.randint(
                         0, int(seq_total_len / 2) - seq_in_len - 1
                     )
-                    if has_jump(
+                    if _has_jump(
                         frames[index_1 : index_1 + seq_in_len]
-                    ) or has_jump(
+                    ) or _has_jump(
                         frames[
                             int(seq_total_len / 2)
                             + index_2 : int(seq_total_len / 2)
@@ -249,10 +304,10 @@ class AdaptiveKalmanDataset(Dataset):
                     gt_targets.extend(gt)
 
         obj = cls()
-        obj.sources = np.array(sources, dtype=np.float32)
-        obj.targets = np.array(targets, dtype=np.float32)
-        obj.gt_sources = np.array(gt_sources, dtype=np.float32)
-        obj.gt_targets = np.array(gt_targets, dtype=np.float32)
+        obj.sources = torch.tensor(sources, dtype=torch.float32)
+        obj.targets = torch.tensor(targets, dtype=torch.float32)
+        obj.gt_sources = torch.tensor(gt_sources, dtype=torch.float32)
+        obj.gt_targets = torch.tensor(gt_targets, dtype=torch.float32)
         return obj
 
     def __len__(self) -> int:
@@ -260,8 +315,8 @@ class AdaptiveKalmanDataset(Dataset):
 
     def __getitem__(self, idx: int):
         return (
-            torch.tensor(self.sources[idx]),
-            torch.tensor(self.targets[idx]),
-            torch.tensor(self.gt_sources[idx]),
-            torch.tensor(self.gt_targets[idx]),
+            self.sources[idx],
+            self.targets[idx],
+            self.gt_sources[idx],
+            self.gt_targets[idx],
         )
