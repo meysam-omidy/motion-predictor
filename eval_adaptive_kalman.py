@@ -43,6 +43,7 @@ from adaptive_kalman_motion import (
     build_cv_innovations,
     confidence_log_r_prior,
     softplus_var,
+    _gaussian_nll_logvar,
 )
 
 
@@ -139,17 +140,22 @@ def evaluate_batch(
 
     loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step)
 
-    var_q = softplus_var(log_q)
+    # log_q is the raw Q-head output, now interpreted directly as log(var_q).
+    # Use exp() to recover var_q — consistent with how AdaptiveKalmanLoss works.
+    log_q_s = log_q.clamp(min=-20.0, max=10.0)
+    var_q = torch.exp(log_q_s).clamp(min=1e-6)
     var_r = softplus_var(log_r)
     innov_sq = innovations.pow(2)
 
-    nll_model = _log_2pi_nll(innovations, var_q).mean()
+    # nll_model uses the same log-space formula as the training loss so the
+    # reported value is directly comparable to the training innovation NLL.
+    nll_model = _gaussian_nll_logvar(innovations, log_q_s, math.log(2 * math.pi)).mean()
     nll_fixed = _log_2pi_nll(
         innovations, torch.full_like(var_q, fixed_var)
     ).mean()
 
     log_r_prior = confidence_log_r_prior(trg_step[..., 12:13], alpha=conf_alpha)
-    var_conf_only = softplus_var(log_r_prior.expand_as(log_q))
+    var_conf_only = softplus_var(log_r_prior.expand_as(var_q))
     nll_conf_r = _log_2pi_nll(innovations, var_conf_only).mean()
 
     observed = trg_step[:, :, OBSERVED_IDX] > 0.5
@@ -177,13 +183,20 @@ def evaluate_batch(
     if observed.any():
         obs_m = observed.unsqueeze(-1).expand_as(innovations)
         batch_metrics["nll_observed"] = (
-            _log_2pi_nll(innovations[obs_m], var_q[obs_m]).mean().item()
+            _gaussian_nll_logvar(
+                innovations[obs_m], log_q_s.expand_as(innovations)[obs_m],
+                math.log(2 * math.pi),
+            ).mean().item()
         )
         batch_metrics["mean_var_r_obs"] = var_r[obs_m].mean().item()
+        batch_metrics["mean_var_q_observed"] = var_q[obs_m].mean().item()
     if gap.any():
         gap_m = gap.unsqueeze(-1).expand_as(innovations)
         batch_metrics["nll_gap"] = (
-            _log_2pi_nll(innovations[gap_m], var_q[gap_m]).mean().item()
+            _gaussian_nll_logvar(
+                innovations[gap_m], log_q_s.expand_as(innovations)[gap_m],
+                math.log(2 * math.pi),
+            ).mean().item()
         )
         batch_metrics["mean_var_q_gap"] = var_q[gap_m].mean().item()
 
