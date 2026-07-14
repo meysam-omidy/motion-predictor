@@ -185,9 +185,9 @@ class  AdaptiveKalmanDataset(Dataset):
                 noise = np.random.randn(*seq.shape)
                 noise[:, 0:2] *= seq[:, 2:4] * noise_coeff
                 noise[:, 2:4] *= seq[:, 2:4] * noise_coeff
-                seq_noised = np.where(
-                    np.random.random(size=seq.shape) < noise_prob, seq + noise, seq
-                )
+                # Per-box (per-timestep) noise: one Bernoulli per frame, not per coord.
+                box_noise_mask = np.random.random(size=(seq.shape[0], 1)) < noise_prob
+                seq_noised = np.where(box_noise_mask, seq + noise, seq)
 
                 seq_enhanced, seq_enhanced_gt = _enhance_sequence(
                     seq, seq_noised, True, max_gap_norm

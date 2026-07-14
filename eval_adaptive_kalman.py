@@ -42,6 +42,7 @@ from adaptive_kalman_motion import (
     build_adaptive_kalman_model,
     build_cv_innovations,
     confidence_log_r_prior,
+    exp_var,
     softplus_var,
     _gaussian_nll_logvar,
 )
@@ -140,26 +141,43 @@ def evaluate_batch(
 
     loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step)
 
-    # log_q is the raw Q-head output, now interpreted directly as log(var_q).
-    # Use exp() to recover var_q — consistent with how AdaptiveKalmanLoss works.
+    # Both heads emit true log-variances; recover with exp (matches AdaptiveKalmanLoss).
     log_q_s = log_q.clamp(min=-20.0, max=10.0)
-    var_q = torch.exp(log_q_s).clamp(min=1e-6)
-    var_r = softplus_var(log_r)
+    log_r_s = log_r.clamp(min=-20.0, max=10.0)
+    var_q = exp_var(log_q_s)
+    var_r = exp_var(log_r_s)
     innov_sq = innovations.pow(2)
 
-    # nll_model uses the same log-space formula as the training loss so the
-    # reported value is directly comparable to the training innovation NLL.
+    # Honest fixed baseline: if fixed_var <= 0, use this batch's mean innov^2.
+    emp_var = innov_sq.mean().clamp(min=1e-6)
+    use_fixed = emp_var if fixed_var <= 0 else torch.tensor(fixed_var, device=emp_var.device)
     nll_model = _gaussian_nll_logvar(innovations, log_q_s, math.log(2 * math.pi)).mean()
-    nll_fixed = _log_2pi_nll(
-        innovations, torch.full_like(var_q, fixed_var)
-    ).mean()
+    nll_fixed = _log_2pi_nll(innovations, torch.full_like(var_q, float(use_fixed))).mean()
 
+    # Conf-R prior used as a Q substitute is a weak baseline; keep it, but also
+    # score how well learned R beats the prior on detector error matching.
     log_r_prior = confidence_log_r_prior(trg_step[..., 12:13], alpha=conf_alpha)
-    var_conf_only = softplus_var(log_r_prior.expand_as(var_q))
+    var_conf_only = exp_var(log_r_prior.expand_as(var_q))
     nll_conf_r = _log_2pi_nll(innovations, var_conf_only).mean()
 
     observed = trg_step[:, :, OBSERVED_IDX] > 0.5
     gap = ~observed
+    meas_sq = (trg_step[..., :4] - gt_step[..., :4]).pow(2).clamp(min=1e-6)
+    r_mask = observed.unsqueeze(-1) & (meas_sq.max(dim=-1, keepdim=True).values > 1e-5)
+    if r_mask.any():
+        log_meas = torch.log(meas_sq[r_mask.expand_as(meas_sq)].clamp(min=1e-8))
+        mae_r = (log_r_s.expand_as(var_r)[r_mask.expand_as(var_r)] - log_meas).abs().mean()
+        mae_prior = (
+            log_r_prior.expand_as(var_r)[r_mask.expand_as(var_r)] - log_meas
+        ).abs().mean()
+        r_beats_prior = float(mae_r < mae_prior)
+        mae_r_val = float(mae_r)
+        mae_prior_val = float(mae_prior)
+    else:
+        r_beats_prior = float("nan")
+        mae_r_val = float("nan")
+        mae_prior_val = float("nan")
+
     calib_ratio = (
         (innov_sq[gap.unsqueeze(-1).expand_as(innov_sq)].mean()
          / var_q[gap.unsqueeze(-1).expand_as(var_q)].mean()).item()
@@ -173,6 +191,10 @@ def evaluate_batch(
         "nll_model": nll_model.item(),
         "nll_fixed_var": nll_fixed.item(),
         "nll_conf_r_only": nll_conf_r.item(),
+        "fixed_var_used": float(use_fixed),
+        "mae_log_r": mae_r_val,
+        "mae_log_r_prior": mae_prior_val,
+        "r_beats_prior": r_beats_prior,
         "calib_ratio": calib_ratio,
         "mean_var_q": var_q.mean().item(),
         "mean_var_r": var_r.mean().item(),
@@ -228,14 +250,24 @@ def compute_correlations(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
         step = max(1, len(arrays["var_r"]) // max(n_steps, 1))
     scores = arrays["scores"]
     gap = arrays["gap_len"]
+    observed = arrays["observed"].astype(bool)
     var_r = arrays["var_r"].reshape(-1, step).mean(axis=1)
     var_q = arrays["var_q"].reshape(-1, step).mean(axis=1)
     innov_sq = arrays["innov_sq"].reshape(-1, step).mean(axis=1)
     var_total = arrays["var_total"].reshape(-1, step).mean(axis=1)
 
+    # R↔score: observed frames only (gap score is forced to 0 and confounds corr).
+    if observed.any():
+        corr_r = _pearson(scores[observed], var_r[observed])
+        corr_r_oms = _pearson(1.0 - scores[observed], var_r[observed])
+    else:
+        corr_r = float("nan")
+        corr_r_oms = float("nan")
+
     return {
-        "corr_r_score": _pearson(scores, var_r),
-        "corr_r_one_minus_score": _pearson(1.0 - scores, var_r),
+        "corr_r_score": corr_r,
+        "corr_r_one_minus_score": corr_r_oms,
+        "corr_r_score_all": _pearson(scores, var_r),
         "corr_q_gap": _pearson(gap, var_q),
         "corr_var_innov_sq": _pearson(var_total, innov_sq),
     }
@@ -276,9 +308,10 @@ def verdict(summary: dict) -> dict:
 
     nll_m = summary.get("nll_model", float("inf"))
     nll_f = summary.get("nll_fixed_var", float("inf"))
-    nll_c = summary.get("nll_conf_r_only", float("inf"))
     checks["beats_fixed_variance"] = nll_m < nll_f
-    checks["beats_conf_r_baseline"] = nll_m < nll_c
+
+    rbp = summary.get("r_beats_prior", float("nan"))
+    checks["r_beats_prior"] = (rbp == rbp) and rbp > 0.5  # mean of 0/1 flags
 
     calib = summary.get("calib_q_gap", summary.get("calib_ratio", 0.0))
     checks["calibration_ok"] = (
@@ -294,7 +327,7 @@ def verdict(summary: dict) -> dict:
     gap_q = summary.get("mean_var_q_gap", 0.0)
     obs_q = summary.get("mean_var_q_observed", 0.0)
     if gap_q and obs_q:
-        checks["q_higher_in_gaps"] = gap_q > obs_q
+        checks["q_higher_in_gaps"] = gap_q > obs_q * 1.05
     else:
         checks["q_higher_in_gaps"] = None
 
@@ -312,9 +345,8 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
     print(f"  Loss (total):        {summary.get('loss_total', 0):.4f}")
     print(f"  Innovation NLL:      {summary.get('nll_model', 0):.4f}")
     print(f"    vs fixed-var:      {summary.get('nll_fixed_var', 0):.4f}  "
-          f"({'better' if checks.get('beats_fixed_variance') else 'worse'})")
-    print(f"    vs conf-R only:    {summary.get('nll_conf_r_only', 0):.4f}  "
-          f"({'better' if checks.get('beats_conf_r_baseline') else 'worse'})")
+          f"(fixed={summary.get('fixed_var_used', float('nan')):.2e}; "
+          f"{'better' if checks.get('beats_fixed_variance') else 'worse'})")
     print(f"  Calibration (Q,gap): {summary.get('calib_q_gap', summary.get('calib_ratio', float('nan'))):.3f}  "
           f"(~1.0 ideal; {'ok' if checks.get('calibration_ok') else 'check'})")
     print(f"  Mean var Q / R:      {summary.get('mean_var_q', 0):.2e} / "
@@ -324,7 +356,10 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
               f"{summary.get('nll_gap', float('nan')):.4f}")
         print(f"  Mean var Q obs/gap:  {summary.get('mean_var_q_observed', 0):.2e} / "
               f"{summary.get('mean_var_q_gap', 0):.2e}")
-    print(f"  corr(R, score):      {summary.get('corr_r_score', float('nan')):.3f}  "
+    print(f"  R log-MAE vs prior:  {summary.get('mae_log_r', float('nan')):.4f} / "
+          f"{summary.get('mae_log_r_prior', float('nan')):.4f}  "
+          f"({'better' if checks.get('r_beats_prior') else 'worse/same'})")
+    print(f"  corr(R, score|obs):  {summary.get('corr_r_score', float('nan')):.3f}  "
           f"(expect negative)")
     print(f"  corr(Q, gap_len):    {summary.get('corr_q_gap', float('nan')):.3f}  "
           f"(expect positive)")
@@ -581,7 +616,12 @@ if __name__ == "__main__":
 
     p.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "lstm"])
     p.add_argument("--conf_alpha", type=float, default=None)
-    p.add_argument("--fixed_var", type=float, default=1e-3, help="Baseline fixed variance")
+    p.add_argument(
+        "--fixed_var",
+        type=float,
+        default=-1.0,
+        help="Baseline fixed variance; <=0 means use batch mean innov^2 (honest)",
+    )
 
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)

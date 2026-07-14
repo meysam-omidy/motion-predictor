@@ -4,7 +4,7 @@ Context-aware adaptive Kalman noise predictor (Q/R only).
 Thesis-aligned design (see analysis/THESIS_DIAGNOSTICS_AND_TRACKER_GUIDANCE.md):
 - Predict diagonal log-variance for process noise Q and measurement noise R.
 - No bbox regression head (kalman_fusion_blend = 0 at tracker integration time).
-- R uses a confidence prior R ∝ exp(α(1 - score)) plus a learned residual.
+- R uses a confidence prior plus a learned exp() residual (non-saturating; R >= prior).
 - Training loss: innovation NLL under a constant-velocity Kalman proxy + R supervision.
 
 Use with ``AdaptiveKalmanDataset`` (15-D features) and ``train_adaptive_kalman.py``.
@@ -24,6 +24,11 @@ import torch.nn.functional as F
 
 def softplus_var(log_v: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
     return F.softplus(log_v) + floor
+
+
+def exp_var(log_v: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+    """Recover a positive variance from a log-variance (non-saturating)."""
+    return torch.exp(log_v.clamp(min=-20.0, max=10.0)).clamp(min=floor)
 
 
 def confidence_log_r_prior(
@@ -122,9 +127,9 @@ class AdaptiveKalmanLoss(nn.Module):
 
     - **Q / innovation NLL:** CV prediction error is explained by process noise Q
       (not Q+R — that let Q collapse to the softplus floor).
-    - **R supervision:** on observed steps only, match var_r to per-step detector
-      error (noisy box vs GT), in log-variance space after softplus.
+    - **R supervision:** on observed noisy steps, match log_var_r to log(det_error²).
     - **Q gap supervision:** on dropped/missing steps, match var_q to |innovation|².
+    - **Q gap trend:** encourage larger Q when frames_since_obs is larger.
     - **Q easy penalty:** lightly penalize large Q on high-confidence observed steps.
     """
 
@@ -133,9 +138,10 @@ class AdaptiveKalmanLoss(nn.Module):
     def __init__(
         self,
         innovation_coeff: float = 1.0,
-        r_supervise_coeff: float = 0.5,
-        q_gap_coeff: float = 1.0,
+        r_supervise_coeff: float = 1.0,
+        q_gap_coeff: float = 2.0,
         q_easy_coeff: float = 0.01,
+        q_gap_trend_coeff: float = 0.5,
         conf_alpha: float = 2.0,
         var_floor: float = 1e-6,
     ):
@@ -144,6 +150,7 @@ class AdaptiveKalmanLoss(nn.Module):
         self.r_supervise_coeff = r_supervise_coeff
         self.q_gap_coeff = q_gap_coeff
         self.q_easy_coeff = q_easy_coeff
+        self.q_gap_trend_coeff = q_gap_trend_coeff
         self.conf_alpha = conf_alpha
         self.var_floor = var_floor
 
@@ -155,13 +162,12 @@ class AdaptiveKalmanLoss(nn.Module):
         trg: torch.Tensor,
         gt_trg: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        # log_var_q is the raw Q-head output, interpreted directly as log(var_q).
-        # Clamping prevents numerical overflow in exp(); the gradient of the
-        # log-space NLL never vanishes regardless of how negative log_var_q gets,
-        # which fixes the softplus saturation that caused constant Q output.
+        # log_var_q / log_var_r are true log-variances. Use exp — never softplus —
+        # so gradients stay well-conditioned (no softplus saturation).
         log_var_q_s = log_var_q.clamp(min=-20.0, max=10.0)
-        var_q = torch.exp(log_var_q_s).clamp(min=self.var_floor)  # for penalties/metrics
-        var_r = softplus_var(log_var_r, floor=self.var_floor)
+        log_var_r_s = log_var_r.clamp(min=-20.0, max=10.0)
+        var_q = exp_var(log_var_q_s, floor=self.var_floor)
+        var_r = exp_var(log_var_r_s, floor=self.var_floor)
 
         innov_sq = innovations.pow(2).clamp(min=self.var_floor)
 
@@ -170,23 +176,24 @@ class AdaptiveKalmanLoss(nn.Module):
         loss_innov = _gaussian_nll_logvar(innovations, log_var_q_s, self._LOG_2PI).mean()
 
         scores = trg[..., 12:13].clamp(0.0, 1.0)
+        gap_len = trg[..., 13:14].clamp(0.0, 1.0)
         observed = trg[..., 14:15] > 0.5
         gap = ~observed
 
-        # R supervision: only where detector noise exists (skip clean frames)
+        # R supervision: observed frames with any measurable detector error.
+        # Match log_var_r directly (short gradient path, same spirit as Q-gap).
         meas_sq = (trg[..., :4] - gt_trg[..., :4]).pow(2).clamp(min=self.var_floor)
         per_step_meas = meas_sq.max(dim=-1, keepdim=True).values
-        has_det_noise = per_step_meas > (self.var_floor * 100)
+        has_det_noise = per_step_meas > (self.var_floor * 10)
         r_mask = observed & has_det_noise
         if r_mask.any():
-            loss_r = _log_var_match(
-                var_r[r_mask.expand_as(var_r)], meas_sq[r_mask.expand_as(meas_sq)]
-            )
+            log_r_pred = log_var_r_s[r_mask.expand_as(log_var_r_s)]
+            log_r_tgt = torch.log(meas_sq[r_mask.expand_as(meas_sq)].clamp(min=1e-8))
+            loss_r = F.smooth_l1_loss(log_r_pred, log_r_tgt)
         else:
             loss_r = innovations.new_tensor(0.0)
 
         # Q gap supervision: match log_var_q directly to log(innov²) on dropped frames.
-        # This avoids an extra softplus→log round-trip and keeps the gradient path short.
         if gap.any():
             log_var_q_gap = log_var_q_s[gap.expand_as(log_var_q_s)]
             gap_target = innov_sq[gap.expand_as(innov_sq)]
@@ -194,6 +201,22 @@ class AdaptiveKalmanLoss(nn.Module):
             loss_q_gap = F.smooth_l1_loss(log_var_q_gap, log_gap_target)
         else:
             loss_q_gap = innovations.new_tensor(0.0)
+
+        # Encourage Q to grow with normalized gap length (context sensitivity).
+        # Compare mean log_q on above-median vs below-median gap steps.
+        gap_flat = gap_len.squeeze(-1)
+        log_q_step = log_var_q_s.mean(dim=-1)
+        if gap_flat.numel() > 1 and gap_flat.std() > 1e-6:
+            med = gap_flat.median()
+            high = gap_flat >= med
+            low = gap_flat < med
+            if high.any() and low.any():
+                # Penalize when high-gap Q is smaller than low-gap Q.
+                loss_q_gap_trend = F.relu(log_q_step[low].mean() - log_q_step[high].mean())
+            else:
+                loss_q_gap_trend = innovations.new_tensor(0.0)
+        else:
+            loss_q_gap_trend = innovations.new_tensor(0.0)
 
         # Keep Q small when we have a confident observation
         easy = scores * observed.float()
@@ -203,6 +226,7 @@ class AdaptiveKalmanLoss(nn.Module):
             self.innovation_coeff * loss_innov
             + self.r_supervise_coeff * loss_r
             + self.q_gap_coeff * loss_q_gap
+            + self.q_gap_trend_coeff * loss_q_gap_trend
             + self.q_easy_coeff * loss_q_easy
         )
 
@@ -216,6 +240,7 @@ class AdaptiveKalmanLoss(nn.Module):
                 "loss_innov": float(loss_innov),
                 "loss_r": float(loss_r),
                 "loss_q_gap": float(loss_q_gap),
+                "loss_q_gap_trend": float(loss_q_gap_trend),
                 "loss_q_easy": float(loss_q_easy),
                 "mean_var_q": float(var_q.mean()),
                 "mean_var_r": float(var_r.mean()),
@@ -244,12 +269,11 @@ class _AdaptiveKalmanHead(nn.Module):
         self.q_head = nn.Linear(hidden_dim, 4)
         nn.init.constant_(self.q_head.bias, q_init_bias)
         nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
-        # R residual: softplus(bias) must start near 0 so var_r begins at the
-        # confidence prior. Zero bias → softplus(0) = 0.693 which swamps the
-        # prior and wastes early training correcting this. Use -10 instead:
-        # softplus(-10) ≈ 4.5e-5 ≈ 0.
+        # R residual in *variance* space via exp(logits) — never saturates.
+        # prior_var + exp(logit) keeps R >= confidence prior with healthy grads.
+        # Bias -10 → exp(-10) ≈ 4.5e-5, a tiny bump on top of the prior.
         self.r_residual_head = nn.Linear(hidden_dim, 4)
-        nn.init.zeros_(self.r_residual_head.weight)
+        nn.init.xavier_uniform_(self.r_residual_head.weight, gain=0.1)
         nn.init.constant_(self.r_residual_head.bias, -10.0)
 
     def forward(
@@ -257,9 +281,9 @@ class _AdaptiveKalmanHead(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_var_q = self.q_head(hidden)
         log_r_prior = confidence_log_r_prior(scores, alpha=self.conf_alpha)
-        prior_var = softplus_var(log_r_prior)
-        # Residual is additive in variance space (keeps R >= conf-R prior)
-        delta_r = F.softplus(self.r_residual_head(hidden))
+        prior_var = exp_var(log_r_prior)
+        # Non-saturating positive residual (fixes softplus-dead R head).
+        delta_r = exp_var(self.r_residual_head(hidden), floor=0.0)
         var_r = prior_var + delta_r
         log_var_r = torch.log(var_r.clamp(min=1e-8))
         return log_var_q, log_var_r
