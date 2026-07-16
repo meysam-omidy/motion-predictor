@@ -139,6 +139,7 @@ def main(args):
         r_supervise_coeff=args.r_supervise_coeff,
         q_gap_coeff=args.q_gap_coeff,
         q_easy_coeff=args.q_easy_coeff,
+        q_gap_trend_coeff=args.q_gap_trend_coeff,
         conf_alpha=args.conf_alpha,
     )
     optimizer = AdamW(
@@ -184,7 +185,8 @@ def main(args):
         print(
             f"Epoch {epoch}/{args.epochs} | "
             f"train {train_loss:.4f} (innov {train_metrics.get('loss_innov', 0):.4f}, "
-            f"r {train_metrics.get('loss_r', 0):.4f}, q_gap {train_metrics.get('loss_q_gap', 0):.4f}) | "
+            f"r {train_metrics.get('loss_r', 0):.4f}, q_gap {train_metrics.get('loss_q_gap', 0):.4f}, "
+            f"trend {train_metrics.get('loss_q_gap_trend', 0):.4f}) | "
             f"val {val_loss:.4f} (q_gap {val_metrics.get('loss_q_gap', 0):.4f}, "
             f"var_q {val_metrics.get('mean_var_q', 0):.2e}, calib_q {val_metrics.get('calib_q_gap', float('nan')):.2f}, "
             f"r_frac {val_metrics.get('frac_r_supervised', 0):.2f}) | "
@@ -284,9 +286,10 @@ if __name__ == "__main__":
     p.add_argument("--teacher_forcing_ratio", type=float, default=1)
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
-    p.add_argument("--r_supervise_coeff", type=float, default=0.5)
-    p.add_argument("--q_gap_coeff", type=float, default=0.3)
+    p.add_argument("--r_supervise_coeff", type=float, default=1.0)
+    p.add_argument("--q_gap_coeff", type=float, default=2.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
+    p.add_argument("--q_gap_trend_coeff", type=float, default=0.5)
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
     p.add_argument("--batch_size", type=int, default=128)

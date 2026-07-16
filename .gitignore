@@ -212,5 +212,5 @@ file*.ipynb
 data2
 pretrained
 phase1
-
 checkpoints
+eval
