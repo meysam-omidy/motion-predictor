@@ -304,10 +304,10 @@ class  AdaptiveKalmanDataset(Dataset):
                     gt_targets.extend(gt)
 
         obj = cls()
-        obj.sources = torch.tensor(sources, dtype=torch.float32)
-        obj.targets = torch.tensor(targets, dtype=torch.float32)
-        obj.gt_sources = torch.tensor(gt_sources, dtype=torch.float32)
-        obj.gt_targets = torch.tensor(gt_targets, dtype=torch.float32)
+        obj.sources = torch.tensor(np.array(sources), dtype=torch.float32)
+        obj.targets = torch.tensor(np.array(targets), dtype=torch.float32)
+        obj.gt_sources = torch.tensor(np.array(gt_sources), dtype=torch.float32)
+        obj.gt_targets = torch.tensor(np.array(gt_targets), dtype=torch.float32)
         return obj
 
     def __len__(self) -> int:
