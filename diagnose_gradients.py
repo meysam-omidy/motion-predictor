@@ -330,7 +330,7 @@ def run_term_attribution(
     terms = {
         "innov_only": dict(
             innovation_coeff=1.0, r_supervise_coeff=0.0, q_gap_coeff=0.0,
-            q_easy_coeff=0.0, q_gap_trend_coeff=0.0,
+            q_easy_coeff=0.0, q_gap_trend_coeff=0.0, innov_obs_weight=0.25,
         ),
         "r_only": dict(
             innovation_coeff=0.0, r_supervise_coeff=1.0, q_gap_coeff=0.0,
@@ -398,6 +398,7 @@ def diagnose(args) -> int:
         q_gap_coeff=args.q_gap_coeff,
         q_easy_coeff=args.q_easy_coeff,
         q_gap_trend_coeff=args.q_gap_trend_coeff,
+        innov_obs_weight=args.innov_obs_weight,
         conf_alpha=args.conf_alpha,
     )
 
@@ -505,7 +506,7 @@ def diagnose(args) -> int:
         if frac_r > 0 and r_only_norm < R_HEAD_DEAD_NORM:
             issues.append(
                 f"R head DEAD under r_only (||g||={r_only_norm:.2e} < {R_HEAD_DEAD_NORM:g}) "
-                f"while frac_r_supervised={frac_r:.2f} - softplus/exp saturation or broken R loss"
+                f"while frac_r_supervised={frac_r:.2f} - R head not receiving grads"
             )
         elif frac_r == 0 and r_head.l2_norm < HEAD_MIN_NORM:
             goods.append("R head quiet (expected if no noisy observed frames in sample)")
@@ -588,10 +589,11 @@ def parse_args():
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
-    p.add_argument("--r_supervise_coeff", type=float, default=1.0)
-    p.add_argument("--q_gap_coeff", type=float, default=2.0)
+    p.add_argument("--r_supervise_coeff", type=float, default=2.0)
+    p.add_argument("--q_gap_coeff", type=float, default=3.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
-    p.add_argument("--q_gap_trend_coeff", type=float, default=0.5)
+    p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
+    p.add_argument("--innov_obs_weight", type=float, default=0.25)
     return p.parse_args()
 
 

@@ -4,8 +4,8 @@ Train context-aware adaptive Kalman Q/R predictor (no bbox head).
 Recommended defaults follow analysis/THESIS_DIAGNOSTICS_AND_TRACKER_GUIDANCE.md:
 - seq_in_len 30–50 aligned with tracker update window
 - random_drop_prob 0.25–0.4 for occlusion gaps
-- innovation NLL + stronger R supervision vs legacy learned_noise_motion
-- optional DanceTrack oversampling
+- gap-weighted innovation NLL + R supervision (signed log-delta on conf prior)
+- Q gap match + gap-only trend correlation; optional DanceTrack oversampling
 
 Example:
   python train_adaptive_kalman.py \\
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -55,8 +56,14 @@ def collect_paths(args, split: str) -> list[str]:
 
 def build_datasets(args):
     weights = {}
+    if args.mot17_weight > 1:
+        weights["MOT17"] = args.mot17_weight
+    if args.mot20_weight > 1:
+        weights["MOT20"] = args.mot20_weight
     if args.dancetrack_weight > 1:
         weights["DanceTrack"] = args.dancetrack_weight
+    if args.sportsmot_weight > 1:
+        weights["SportsMOT"] = args.sportsmot_weight
 
     train_kw = dict(
         seq_in_len=args.seq_in_len,
@@ -140,6 +147,7 @@ def main(args):
         q_gap_coeff=args.q_gap_coeff,
         q_easy_coeff=args.q_easy_coeff,
         q_gap_trend_coeff=args.q_gap_trend_coeff,
+        innov_obs_weight=args.innov_obs_weight,
         conf_alpha=args.conf_alpha,
     )
     optimizer = AdamW(
@@ -174,8 +182,6 @@ def main(args):
         val_loss, val_metrics = model.evaluate(
             val_loader, criterion, str(device)
         )
-        scheduler.step(val_loss)
-
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_metrics"].append(train_metrics)
@@ -192,6 +198,16 @@ def main(args):
             f"r_frac {val_metrics.get('frac_r_supervised', 0):.2f}) | "
             f"lr {lr:.2e} | {time.time()-t0:.1f}s"
         )
+
+        if not math.isfinite(train_loss) or not math.isfinite(val_loss):
+            print(
+                "Non-finite loss detected — stopping. "
+                f"Best checkpoint retained (val {best_val:.4f})."
+            )
+            break
+
+        if math.isfinite(val_loss):
+            scheduler.step(val_loss)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -251,7 +267,7 @@ if __name__ == "__main__":
     p.add_argument("--seq_in_len", type=int, default=30)
     p.add_argument("--seq_out_len", type=int, default=20)
     p.add_argument("--seq_total_len", type=int, default=50)
-    p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--steps", type=int, default=3)
     # p.add_argument("--random_jump", action="store_false")
     # p.add_argument("--noise_prob", type=float, default=0)
     # p.add_argument("--noise_coeff", type=float, default=0.1)
@@ -268,7 +284,10 @@ if __name__ == "__main__":
     p.add_argument("--val_noise_coeff", type=float, default=0.1)
     p.add_argument("--val_random_drop_prob", type=float, default=0.2)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
-    p.add_argument("--dancetrack_weight", type=int, default=1)
+    p.add_argument("--mot17_weight", type=int, default=2)
+    p.add_argument("--mot20_weight", type=int, default=1)
+    p.add_argument("--dancetrack_weight", type=int, default=2)
+    p.add_argument("--sportsmot_weight", type=int, default=1)
 
     p.add_argument(
         "--model_type",
@@ -286,20 +305,26 @@ if __name__ == "__main__":
     p.add_argument("--teacher_forcing_ratio", type=float, default=1)
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
-    p.add_argument("--r_supervise_coeff", type=float, default=1.0)
-    p.add_argument("--q_gap_coeff", type=float, default=2.0)
+    p.add_argument("--r_supervise_coeff", type=float, default=2.0)
+    p.add_argument("--q_gap_coeff", type=float, default=3.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
-    p.add_argument("--q_gap_trend_coeff", type=float, default=0.5)
+    p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
+    p.add_argument(
+        "--innov_obs_weight",
+        type=float,
+        default=0.25,
+        help="Weight on innovation NLL for observed steps (gaps use weight 1).",
+    )
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--patience", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_nn")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_1")
     p.add_argument("--save_every", type=int, default=5)
 
     main(p.parse_args())

@@ -4,8 +4,8 @@ Context-aware adaptive Kalman noise predictor (Q/R only).
 Thesis-aligned design (see analysis/THESIS_DIAGNOSTICS_AND_TRACKER_GUIDANCE.md):
 - Predict diagonal log-variance for process noise Q and measurement noise R.
 - No bbox regression head (kalman_fusion_blend = 0 at tracker integration time).
-- R uses a confidence prior plus a learned exp() residual (non-saturating; R >= prior).
-- Training loss: innovation NLL under a constant-velocity Kalman proxy + R supervision.
+- R = confidence prior + learned log-space delta (can go above or below prior).
+- Training loss: gap-weighted innovation NLL + R supervision + Q gap/trend terms.
 
 Use with ``AdaptiveKalmanDataset`` (15-D features) and ``train_adaptive_kalman.py``.
 """
@@ -101,8 +101,40 @@ def _gaussian_nll_logvar(
     Gradient w.r.t. log_var is 0.5*(1 - innov²*exp(-log_var)), which is always
     well-conditioned and never vanishes — unlike the softplus path, which produces
     a sigmoid factor that approaches zero when the logit becomes very negative.
+
+    The quadratic term is capped so a single huge innovation at a tiny predicted
+    variance cannot overflow float32 and poison the run.
     """
-    return 0.5 * (innovations.pow(2) * torch.exp(-log_var) + log_var + log_2pi)
+    # exp(16) ≈ 8.9e6; keep inv-var in a safe float32 range
+    log_var = log_var.clamp(-16.0, 8.0)
+    quad = (innovations.pow(2) * torch.exp(-log_var)).clamp(max=1.0e6)
+    return 0.5 * (quad + log_var + log_2pi)
+
+
+def _grads_finite(module: nn.Module) -> bool:
+    for p in module.parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            return False
+    return True
+
+
+def _optimizer_step_finite(
+    module: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loss: torch.Tensor,
+    max_norm: float = 1.0,
+) -> bool:
+    """Backward + clipped step. Returns False if loss/grads were non-finite (step skipped). """
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    loss.backward()
+    if not _grads_finite(module):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    nn.utils.clip_grad_norm_(module.parameters(), max_norm)
+    optimizer.step()
+    return True
 
 
 class PositionalEncoding(nn.Module):
@@ -125,11 +157,11 @@ class AdaptiveKalmanLoss(nn.Module):
     """
     Context-split Kalman noise loss (thesis-aligned):
 
-    - **Q / innovation NLL:** CV prediction error is explained by process noise Q
-      (not Q+R — that let Q collapse to the softplus floor).
+    - **Q / innovation NLL:** gap-weighted CV error explained by process noise Q.
+      Observed steps are down-weighted so easy frames do not collapse Q.
     - **R supervision:** on observed noisy steps, match log_var_r to log(det_error²).
     - **Q gap supervision:** on dropped/missing steps, match var_q to |innovation|².
-    - **Q gap trend:** encourage larger Q when frames_since_obs is larger.
+    - **Q gap trend:** among gap frames only, encourage larger Q for longer gaps.
     - **Q easy penalty:** lightly penalize large Q on high-confidence observed steps.
     """
 
@@ -138,10 +170,11 @@ class AdaptiveKalmanLoss(nn.Module):
     def __init__(
         self,
         innovation_coeff: float = 1.0,
-        r_supervise_coeff: float = 1.0,
-        q_gap_coeff: float = 2.0,
+        r_supervise_coeff: float = 2.0,
+        q_gap_coeff: float = 3.0,
         q_easy_coeff: float = 0.01,
-        q_gap_trend_coeff: float = 0.5,
+        q_gap_trend_coeff: float = 1.0,
+        innov_obs_weight: float = 0.25,
         conf_alpha: float = 2.0,
         var_floor: float = 1e-6,
     ):
@@ -151,6 +184,7 @@ class AdaptiveKalmanLoss(nn.Module):
         self.q_gap_coeff = q_gap_coeff
         self.q_easy_coeff = q_easy_coeff
         self.q_gap_trend_coeff = q_gap_trend_coeff
+        self.innov_obs_weight = innov_obs_weight
         self.conf_alpha = conf_alpha
         self.var_floor = var_floor
 
@@ -164,25 +198,38 @@ class AdaptiveKalmanLoss(nn.Module):
     ) -> Tuple[torch.Tensor, dict]:
         # log_var_q / log_var_r are true log-variances. Use exp — never softplus —
         # so gradients stay well-conditioned (no softplus saturation).
-        log_var_q_s = log_var_q.clamp(min=-20.0, max=10.0)
-        log_var_r_s = log_var_r.clamp(min=-20.0, max=10.0)
+        # Keep within the same range as the stable NLL path (avoid exp overflow).
+        log_var_q_s = log_var_q.clamp(min=-16.0, max=8.0)
+        log_var_r_s = log_var_r.clamp(min=-16.0, max=8.0)
         var_q = exp_var(log_var_q_s, floor=self.var_floor)
         var_r = exp_var(log_var_r_s, floor=self.var_floor)
 
-        innov_sq = innovations.pow(2).clamp(min=self.var_floor)
-
-        # Innovation NLL in log-variance space: gradient = 0.5*(1 - innov²/var_q),
-        # well-conditioned at all magnitudes of log_var_q.
-        loss_innov = _gaussian_nll_logvar(innovations, log_var_q_s, self._LOG_2PI).mean()
+        innov_sq = innovations.pow(2).clamp(min=self.var_floor, max=1.0e4)
 
         scores = trg[..., 12:13].clamp(0.0, 1.0)
         gap_len = trg[..., 13:14].clamp(0.0, 1.0)
         observed = trg[..., 14:15] > 0.5
         gap = ~observed
 
+        # Gap-weighted innovation NLL: gaps drive Q calibration; observed steps
+        # keep a light anchor so Q does not explode on easy CV residuals.
+        nll = _gaussian_nll_logvar(innovations.clamp(-10.0, 10.0), log_var_q_s, self._LOG_2PI)
+        gap_m = gap.expand_as(nll)
+        obs_m = observed.expand_as(nll)
+        parts = []
+        if gap_m.any():
+            parts.append(nll[gap_m].mean())
+        if obs_m.any() and self.innov_obs_weight > 0:
+            parts.append(self.innov_obs_weight * nll[obs_m].mean())
+        loss_innov = (
+            torch.stack(parts).sum()
+            if parts
+            else innovations.new_tensor(0.0)
+        )
+
         # R supervision: observed frames with any measurable detector error.
         # Match log_var_r directly (short gradient path, same spirit as Q-gap).
-        meas_sq = (trg[..., :4] - gt_trg[..., :4]).pow(2).clamp(min=self.var_floor)
+        meas_sq = (trg[..., :4] - gt_trg[..., :4]).pow(2).clamp(min=self.var_floor, max=1.0e4)
         per_step_meas = meas_sq.max(dim=-1, keepdim=True).values
         has_det_noise = per_step_meas > (self.var_floor * 10)
         r_mask = observed & has_det_noise
@@ -202,17 +249,22 @@ class AdaptiveKalmanLoss(nn.Module):
         else:
             loss_q_gap = innovations.new_tensor(0.0)
 
-        # Encourage Q to grow with normalized gap length (context sensitivity).
-        # Compare mean log_q on above-median vs below-median gap steps.
-        gap_flat = gap_len.squeeze(-1)
+        # Encourage Q to grow with gap length — among gap frames only.
+        # Normalize only gap_len; do NOT divide by log_q.std() (that exploded to
+        # NaN once Q became nearly constant on gaps around epoch ~10).
+        gap_step = gap.squeeze(-1)
         log_q_step = log_var_q_s.mean(dim=-1)
-        if gap_flat.numel() > 1 and gap_flat.std() > 1e-6:
-            med = gap_flat.median()
-            high = gap_flat >= med
-            low = gap_flat < med
-            if high.any() and low.any():
-                # Penalize when high-gap Q is smaller than low-gap Q.
-                loss_q_gap_trend = F.relu(log_q_step[low].mean() - log_q_step[high].mean())
+        gl = gap_len.squeeze(-1)
+        if int(gap_step.sum()) >= 4:
+            gl_g = gl[gap_step]
+            lq_g = log_q_step[gap_step]
+            gl_std = gl_g.std()
+            if float(gl_std) > 1e-4:
+                gl_n = (gl_g - gl_g.mean()) / (gl_std + 1e-8)
+                lq_c = (lq_g - lq_g.mean()).clamp(-8.0, 8.0)
+                # assoc ≈ corr * std(log_q); target a mild positive association.
+                assoc = (gl_n * lq_c).mean()
+                loss_q_gap_trend = F.relu(0.15 - assoc)
             else:
                 loss_q_gap_trend = innovations.new_tensor(0.0)
         else:
@@ -269,23 +321,20 @@ class _AdaptiveKalmanHead(nn.Module):
         self.q_head = nn.Linear(hidden_dim, 4)
         nn.init.constant_(self.q_head.bias, q_init_bias)
         nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
-        # R residual in *variance* space via exp(logits) — never saturates.
-        # prior_var + exp(logit) keeps R >= confidence prior with healthy grads.
-        # Bias -10 → exp(-10) ≈ 4.5e-5, a tiny bump on top of the prior.
+        # Additive log-space delta on the confidence prior. Zero init → start at
+        # prior; signed delta lets R go above or below the prior (unlike the old
+        # prior_var + exp(logit) floor which froze loss_r when prior was too high).
         self.r_residual_head = nn.Linear(hidden_dim, 4)
-        nn.init.xavier_uniform_(self.r_residual_head.weight, gain=0.1)
-        nn.init.constant_(self.r_residual_head.bias, -10.0)
+        nn.init.zeros_(self.r_residual_head.weight)
+        nn.init.zeros_(self.r_residual_head.bias)
 
     def forward(
         self, hidden: torch.Tensor, scores: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_var_q = self.q_head(hidden)
         log_r_prior = confidence_log_r_prior(scores, alpha=self.conf_alpha)
-        prior_var = exp_var(log_r_prior)
-        # Non-saturating positive residual (fixes softplus-dead R head).
-        delta_r = exp_var(self.r_residual_head(hidden), floor=0.0)
-        var_r = prior_var + delta_r
-        log_var_r = torch.log(var_r.clamp(min=1e-8))
+        delta = self.r_residual_head(hidden).clamp(-6.0, 6.0)
+        log_var_r = (log_r_prior + delta).clamp(-16.0, 8.0)
         return log_var_q, log_var_r
 
 
@@ -404,27 +453,36 @@ class AdaptiveKalmanTransformer(nn.Module):
         self.train()
         total = 0.0
         agg: dict = {}
-        n = max(len(dataloader), 1)
+        n_ok = 0
+        n_skip = 0
         for src, trg, gt_src, gt_trg in dataloader:
             src = src.to(device)
             trg = trg.to(device)
             gt_src = gt_src.to(device)
             gt_trg = gt_trg.to(device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             ctx = trg[:, :-1, :]
             log_q, log_r = self.forward(src, ctx)
             innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
             loss, metrics = criterion(
                 log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
             )
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-            optimizer.step()
-            total += loss.item()
+            if not _optimizer_step_finite(self, optimizer, loss):
+                n_skip += 1
+                continue
+            total += float(loss.detach())
+            n_ok += 1
             for k, v in metrics.items():
-                agg[k] = agg.get(k, 0.0) + v
-        return total / n, {k: v / n for k, v in agg.items()}
+                if isinstance(v, float) and math.isfinite(v):
+                    agg[k] = agg.get(k, 0.0) + v
+        if n_skip:
+            print(f"  skipped {n_skip} non-finite train batches")
+        n = max(n_ok, 1)
+        out_metrics = {k: v / n for k, v in agg.items()}
+        out_metrics["n_batches_ok"] = float(n_ok)
+        out_metrics["n_batches_skip"] = float(n_skip)
+        return (total / n) if n_ok else float("nan"), out_metrics
 
     def evaluate(
         self,
@@ -547,25 +605,34 @@ class AdaptiveKalmanLSTM(nn.Module):
         self.train()
         total = 0.0
         agg: dict = {}
-        n = max(len(dataloader), 1)
+        n_ok = 0
+        n_skip = 0
         for src, trg, gt_src, gt_trg in dataloader:
             src = src.to(device)
             trg = trg.to(device)
             gt_src = gt_src.to(device)
             gt_trg = gt_trg.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             log_q, log_r = self.forward(src, trg[:, :-1, :])
             innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
             loss, metrics = criterion(
                 log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
             )
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-            optimizer.step()
-            total += loss.item()
+            if not _optimizer_step_finite(self, optimizer, loss):
+                n_skip += 1
+                continue
+            total += float(loss.detach())
+            n_ok += 1
             for k, v in metrics.items():
-                agg[k] = agg.get(k, 0.0) + v
-        return total / n, {k: v / n for k, v in agg.items()}
+                if isinstance(v, float) and math.isfinite(v):
+                    agg[k] = agg.get(k, 0.0) + v
+        if n_skip:
+            print(f"  skipped {n_skip} non-finite train batches")
+        n = max(n_ok, 1)
+        out_metrics = {k: v / n for k, v in agg.items()}
+        out_metrics["n_batches_ok"] = float(n_ok)
+        out_metrics["n_batches_skip"] = float(n_skip)
+        return (total / n) if n_ok else float("nan"), out_metrics
 
     def evaluate(
         self,

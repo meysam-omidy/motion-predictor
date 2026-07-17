@@ -587,12 +587,12 @@ if __name__ == "__main__":
     p.add_argument("--output_dir", type=str, default="./eval/adaptive_kalman")
     p.add_argument("--val_path", type=str, default=None, help="Single generic val root")
     p.add_argument("--mot17_val_path", type=str, default="C:/Projects/.Datasets/MOT17/val")
-    # p.add_argument("--mot20_val_path", type=str, default=None)
-    p.add_argument("--mot20_val_path", type=str, default="C:/Projects/.Datasets/MOT20/val")
-    # p.add_argument("--dancetrack_val_path", type=str, default=None)
-    p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
-    # p.add_argument("--sportsmot_val_path", type=str, default=None)
-    p.add_argument("--sportsmot_val_path", type=str, default="C:/Projects/.Datasets/SportsMOT/val")
+    p.add_argument("--mot20_val_path", type=str, default=None)
+    # p.add_argument("--mot20_val_path", type=str, default="C:/Projects/.Datasets/MOT20/val")
+    p.add_argument("--dancetrack_val_path", type=str, default=None)
+    # p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
+    p.add_argument("--sportsmot_val_path", type=str, default=None)
+    # p.add_argument("--sportsmot_val_path", type=str, default="C:/Projects/.Datasets/SportsMOT/val")
 
     p.add_argument(
         "--use_ckpt_seq_config",
