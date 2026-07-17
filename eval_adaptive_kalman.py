@@ -129,15 +129,16 @@ def evaluate_batch(
     fixed_var: float,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     """Return scalar metrics and numpy arrays for correlation / calibration."""
-    ctx = trg[:, :-1, :]
     if isinstance(model, AdaptiveKalmanLSTM):
-        log_q, log_r = model(src, ctx, teacher_forcing_ratio=1.0)
+        log_q, log_r = model(src, trg, teacher_forcing_ratio=1.0)
     else:
-        log_q, log_r = model(src, ctx)
+        log_q, log_r = model(src, trg)
 
-    innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-    trg_step = trg[:, 1:, :]
-    gt_step = gt_trg[:, 1:, :]
+    trg_step = trg
+    gt_step = gt_trg
+    innovations = build_cv_innovations(
+        gt_src, gt_trg, observed=trg_step[:, :, OBSERVED_IDX]
+    )
 
     loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step)
 
@@ -436,7 +437,7 @@ def run_eval(
         gt_src = gt_src.to(device)
         gt_trg = gt_trg.to(device)
         bsz = src.size(0)
-        steps = trg.size(1) - 1
+        steps = trg.size(1)
 
         batch_m, arrs = evaluate_batch(
             model, src, trg, gt_src, gt_trg, criterion, conf_alpha, fixed_var

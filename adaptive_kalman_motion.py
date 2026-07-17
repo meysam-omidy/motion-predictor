@@ -22,11 +22,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def softplus_var(log_v: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+# Variance floor. Normalized-xywh process noise on heavily-interpolated GT
+# (e.g. MOT17) is tiny — gap innovation² can sit ~6e-7, i.e. *below* a 1e-6
+# floor. A 1e-6 floor forces the model to over-predict variance on low-motion
+# data and fails the eval calibration check. 1e-8 gives room for both MOT17
+# (slow) and DanceTrack/SportsMOT (fast) scales without underflow.
+VAR_FLOOR = 1e-8
+
+
+def softplus_var(log_v: torch.Tensor, floor: float = VAR_FLOOR) -> torch.Tensor:
     return F.softplus(log_v) + floor
 
 
-def exp_var(log_v: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+def exp_var(log_v: torch.Tensor, floor: float = VAR_FLOOR) -> torch.Tensor:
     """Recover a positive variance from a log-variance (non-saturating)."""
     return torch.exp(log_v.clamp(min=-20.0, max=10.0)).clamp(min=floor)
 
@@ -57,22 +65,58 @@ def constant_velocity_predict(
 def build_cv_innovations(
     gt_src: torch.Tensor,
     gt_trg: torch.Tensor,
+    observed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Per-step innovations y - μ_CV for each target timestep.
 
     gt_src: (B, S, D), gt_trg: (B, T, D)
+    observed: optional (B, T) mask (1 = real detection, 0 = dropped / gap).
+
+    The CV base advances the way a constant-velocity tracker actually behaves:
+    on an **observed** step the state is corrected to the (true) detection, but
+    during a **gap** there is no measurement, so the filter keeps extrapolating
+    its own prediction (velocity frozen). Error therefore *accumulates* over the
+    length of the gap — which is exactly the process-noise signal Q must learn.
+
+    When ``observed`` is None the old behaviour (reset to truth every step) is
+    kept for backward compatibility, but training/eval should always pass it so
+    gap innovations grow with gap length.
+
     Returns: (B, T, 4)
     """
     b, t_len, _ = gt_trg.shape
-    prev = gt_src[:, -1, :4]
-    prev_prev = gt_src[:, -2, :4]
+    # "true" base = last two ground-truth positions. Used to score the honest
+    # one-step process noise on observed frames (no reappearance spike).
+    t_prev = gt_src[:, -1, :4]
+    t_prev_prev = gt_src[:, -2, :4]
+    # "drift" base = the tracker's own prediction. During a gap it keeps
+    # extrapolating (velocity frozen), so its error accumulates with gap length.
+    d_prev = t_prev.clone()
+    d_prev_prev = t_prev_prev.clone()
+
     innovations = []
     for t in range(t_len):
-        mu = constant_velocity_predict(prev, prev_prev)
-        innovations.append(gt_trg[:, t, :4] - mu)
-        prev_prev = prev
-        prev = gt_trg[:, t, :4]
+        cur = gt_trg[:, t, :4]
+        if observed is None:
+            mu = constant_velocity_predict(t_prev, t_prev_prev)
+            innovations.append(cur - mu)
+            t_prev_prev, t_prev = t_prev, cur
+            continue
+
+        obs_t = (observed[:, t] > 0.5).unsqueeze(-1)
+        mu_true = constant_velocity_predict(t_prev, t_prev_prev)
+        mu_drift = constant_velocity_predict(d_prev, d_prev_prev)
+        # Observed -> honest one-step CV error from the true state.
+        # Gap      -> error of the (accumulating) drifted prediction.
+        mu = torch.where(obs_t, mu_true, mu_drift)
+        innovations.append(cur - mu)
+
+        # Drift base: reset to truth on observed, propagate prediction on gaps.
+        d_prev_prev = torch.where(obs_t, t_prev, d_prev)
+        d_prev = torch.where(obs_t, cur, mu_drift)
+        # True base always advances with ground truth.
+        t_prev_prev, t_prev = t_prev, cur
     return torch.stack(innovations, dim=1)
 
 
@@ -105,8 +149,9 @@ def _gaussian_nll_logvar(
     The quadratic term is capped so a single huge innovation at a tiny predicted
     variance cannot overflow float32 and poison the run.
     """
-    # exp(16) ≈ 8.9e6; keep inv-var in a safe float32 range
-    log_var = log_var.clamp(-16.0, 8.0)
+    # exp(20) ≈ 4.9e8; keep inv-var in a safe float32 range. The quadratic term
+    # is capped so a huge innovation at a tiny predicted variance cannot overflow.
+    log_var = log_var.clamp(-20.0, 8.0)
     quad = (innovations.pow(2) * torch.exp(-log_var)).clamp(max=1.0e6)
     return 0.5 * (quad + log_var + log_2pi)
 
@@ -157,10 +202,17 @@ class AdaptiveKalmanLoss(nn.Module):
     """
     Context-split Kalman noise loss (thesis-aligned):
 
-    - **Q / innovation NLL:** gap-weighted CV error explained by process noise Q.
-      Observed steps are down-weighted so easy frames do not collapse Q.
+    - **Q / innovation NLL (primary Q driver):** gap-weighted CV error explained
+      by process noise Q. The NLL naturally calibrates var_q to the *conditional
+      mean* of innovation², so it is heteroscedastic (larger in gaps, grows with
+      gap length) and beats a fixed variance. Observed steps are down-weighted so
+      easy frames do not dominate Q.
     - **R supervision:** on observed noisy steps, match log_var_r to log(det_error²).
-    - **Q gap supervision:** on dropped/missing steps, match var_q to |innovation|².
+    - **Q gap supervision (OFF by default, ``q_gap_coeff=0``):** a per-element
+      ``smooth_l1`` in log-space against ``log(innov²)``. On heavily-interpolated
+      GT (e.g. MOT17) most innovations are ~0, so this log match collapses var_q
+      to the floor (it targets the log-median, not the mean) and *fights* the NLL.
+      Kept as an option for very dynamic data, but disabled by default.
     - **Q gap trend:** among gap frames only, encourage larger Q for longer gaps.
     - **Q easy penalty:** lightly penalize large Q on high-confidence observed steps.
     """
@@ -171,12 +223,12 @@ class AdaptiveKalmanLoss(nn.Module):
         self,
         innovation_coeff: float = 1.0,
         r_supervise_coeff: float = 2.0,
-        q_gap_coeff: float = 3.0,
+        q_gap_coeff: float = 0.0,
         q_easy_coeff: float = 0.01,
         q_gap_trend_coeff: float = 1.0,
         innov_obs_weight: float = 0.25,
         conf_alpha: float = 2.0,
-        var_floor: float = 1e-6,
+        var_floor: float = VAR_FLOOR,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
@@ -199,8 +251,8 @@ class AdaptiveKalmanLoss(nn.Module):
         # log_var_q / log_var_r are true log-variances. Use exp — never softplus —
         # so gradients stay well-conditioned (no softplus saturation).
         # Keep within the same range as the stable NLL path (avoid exp overflow).
-        log_var_q_s = log_var_q.clamp(min=-16.0, max=8.0)
-        log_var_r_s = log_var_r.clamp(min=-16.0, max=8.0)
+        log_var_q_s = log_var_q.clamp(min=-20.0, max=8.0)
+        log_var_r_s = log_var_r.clamp(min=-20.0, max=8.0)
         var_q = exp_var(log_var_q_s, floor=self.var_floor)
         var_r = exp_var(log_var_r_s, floor=self.var_floor)
 
@@ -313,11 +365,14 @@ class AdaptiveKalmanLoss(nn.Module):
 class _AdaptiveKalmanHead(nn.Module):
     """Shared Q/R output heads with confidence-R prior on R."""
 
-    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0, q_init_bias: float = -9.0):
+    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
         super().__init__()
         self.conf_alpha = conf_alpha
         # Q head output is interpreted directly as log(var_q) by the loss.
-        # Bias = -9 → exp(-9) ≈ 1.2e-4 at init, a reasonable starting Q.
+        # Bias = -12 → exp(-12) ≈ 6e-6 at init: a mid-scale start that sits
+        # between low-motion (MOT17 ~6e-7) and high-motion (DanceTrack ~6e-5)
+        # process noise, so the head does not have to travel far in either
+        # direction and low-motion data is not stuck high early in training.
         self.q_head = nn.Linear(hidden_dim, 4)
         nn.init.constant_(self.q_head.bias, q_init_bias)
         nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
@@ -462,12 +517,11 @@ class AdaptiveKalmanTransformer(nn.Module):
             gt_trg = gt_trg.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            ctx = trg[:, :-1, :]
-            log_q, log_r = self.forward(src, ctx)
-            innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-            loss, metrics = criterion(
-                log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
+            log_q, log_r = self.forward(src, trg)
+            innovations = build_cv_innovations(
+                gt_src, gt_trg, observed=trg[..., 14]
             )
+            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -500,11 +554,11 @@ class AdaptiveKalmanTransformer(nn.Module):
                 trg = trg.to(device)
                 gt_src = gt_src.to(device)
                 gt_trg = gt_trg.to(device)
-                log_q, log_r = self.forward(src, trg[:, :-1, :])
-                innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-                loss, metrics = criterion(
-                    log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
+                log_q, log_r = self.forward(src, trg)
+                innovations = build_cv_innovations(
+                    gt_src, gt_trg, observed=trg[..., 14]
                 )
+                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v
@@ -613,11 +667,11 @@ class AdaptiveKalmanLSTM(nn.Module):
             gt_src = gt_src.to(device)
             gt_trg = gt_trg.to(device)
             optimizer.zero_grad(set_to_none=True)
-            log_q, log_r = self.forward(src, trg[:, :-1, :])
-            innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-            loss, metrics = criterion(
-                log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
+            log_q, log_r = self.forward(src, trg)
+            innovations = build_cv_innovations(
+                gt_src, gt_trg, observed=trg[..., 14]
             )
+            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -651,12 +705,12 @@ class AdaptiveKalmanLSTM(nn.Module):
                 gt_src = gt_src.to(device)
                 gt_trg = gt_trg.to(device)
                 log_q, log_r = self.forward(
-                    src, trg[:, :-1, :], teacher_forcing_ratio=1.0
+                    src, trg, teacher_forcing_ratio=1.0
                 )
-                innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-                loss, metrics = criterion(
-                    log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :]
+                innovations = build_cv_innovations(
+                    gt_src, gt_trg, observed=trg[..., 14]
                 )
+                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v

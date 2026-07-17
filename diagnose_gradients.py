@@ -355,9 +355,9 @@ def run_term_attribution(
         crit = AdaptiveKalmanLoss(conf_alpha=criterion.conf_alpha, **coeffs)
         model.train()
         _zero_grads(model)
-        log_q, log_r = model(src, trg[:, :-1, :])
-        innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-        loss, _ = crit(log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :])
+        log_q, log_r = model(src, trg)
+        innovations = build_cv_innovations(gt_src, gt_trg, observed=trg[..., 14])
+        loss, _ = crit(log_q, log_r, innovations, trg, gt_trg)
         if float(loss) == 0.0:
             out[name] = {"loss": 0.0, "q_head_grad_norm": 0.0, "r_head_grad_norm": 0.0}
             continue
@@ -405,9 +405,9 @@ def diagnose(args) -> int:
     model.train()
     _zero_grads(model)
 
-    log_q, log_r = model(src, trg[:, :-1, :])
-    innovations = build_cv_innovations(gt_src, gt_trg[:, 1:, :])
-    loss, metrics = criterion(log_q, log_r, innovations, trg[:, 1:, :], gt_trg[:, 1:, :])
+    log_q, log_r = model(src, trg)
+    innovations = build_cv_innovations(gt_src, gt_trg, observed=trg[..., 14])
+    loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
 
     print("\n=== Forward ===")
     print(f"sample: {sample_info}")
@@ -590,7 +590,7 @@ def parse_args():
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
     p.add_argument("--r_supervise_coeff", type=float, default=2.0)
-    p.add_argument("--q_gap_coeff", type=float, default=3.0)
+    p.add_argument("--q_gap_coeff", type=float, default=0.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
     p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
     p.add_argument("--innov_obs_weight", type=float, default=0.25)

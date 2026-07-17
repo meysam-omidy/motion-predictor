@@ -306,7 +306,9 @@ if __name__ == "__main__":
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)
     p.add_argument("--r_supervise_coeff", type=float, default=2.0)
-    p.add_argument("--q_gap_coeff", type=float, default=3.0)
+    # Off by default: the log-space gap match collapses var_q to the floor on
+    # heavily-interpolated GT (most innov²≈0). The innovation NLL calibrates Q.
+    p.add_argument("--q_gap_coeff", type=float, default=0.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
     p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
     p.add_argument(
