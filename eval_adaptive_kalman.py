@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -36,6 +37,7 @@ from adaptive_kalman_dataset import (
     SCORE_IDX,
     AdaptiveKalmanDataset,
 )
+from adaptive_kalman_dataset_real import AdaptiveKalmanRealDataset
 from adaptive_kalman_motion import (
     AdaptiveKalmanLoss,
     AdaptiveKalmanLSTM,
@@ -493,26 +495,38 @@ def main(args) -> None:
             f"in={args.seq_in_len}, out={args.seq_out_len}, total={args.seq_total_len}"
         )
 
-    val_roots: List[Tuple[str, str]] = []
+    # (name, val_root, detection_dir). Real eval requires a detection dir; if it is
+    # missing (or --synthetic given) we fall back to the old GT+synthetic-noise dataset.
+    val_roots: List[Tuple[str, str, str]] = []
     for name in ("mot17", "mot20", "dancetrack", "sportsmot"):
         p = getattr(args, f"{name}_val_path", None)
+        det = getattr(args, f"{name}_det_dir", None)
         if p:
-            val_roots.append((name.upper(), p))
+            val_roots.append((name.upper(), p, det))
 
     if not val_roots and args.val_path:
-        val_roots.append(("VAL", args.val_path))
+        val_roots.append(("VAL", args.val_path, args.det_dir))
 
     if not val_roots:
         raise ValueError("Provide at least one --*_val_path or --val_path")
 
     ds_kw = dataset_eval_kwargs(args)
+    real_kw = dict(seq_in_len=args.seq_in_len, seq_out_len=args.seq_out_len,
+                   seq_total_len=args.seq_total_len, steps=args.steps,
+                   match_iou=args.match_iou, random_drop_prob=args.random_drop_prob,
+                   max_gap_norm=args.max_gap_norm, min_observed_frac=args.min_observed_frac)
     report = {"checkpoint": str(ckpt_path), "config": vars(args), "datasets": {}}
 
     all_summaries = []
 
-    for ds_name, root in val_roots:
-        print(f"\nEvaluating on {ds_name}: {root}")
-        dataset = AdaptiveKalmanDataset.from_roots([root], **ds_kw)
+    for ds_name, root, det_dir in val_roots:
+        use_real = (not args.synthetic) and det_dir and os.path.isdir(det_dir) and len(os.listdir(det_dir)) > 0
+        mode = "REAL detections" if use_real else "synthetic noise"
+        print(f"\nEvaluating on {ds_name}: {root}  [{mode}]")
+        if use_real:
+            dataset = AdaptiveKalmanRealDataset.from_roots([root], [det_dir], **real_kw)
+        else:
+            dataset = AdaptiveKalmanDataset.from_roots([root], **ds_kw)
         if len(dataset) == 0:
             print(f"  WARNING: no samples for {ds_name}, skipping")
             continue
@@ -550,7 +564,7 @@ def main(args) -> None:
         overall["n_steps"] = combined.n
         # Recompute correlations from merged npz if saved
         merged_arrays = []
-        for ds_name, _ in val_roots:
+        for ds_name, _, _ in val_roots:
             p = out_dir / f"arrays_{ds_name.lower()}.npz"
             if p.exists():
                 merged_arrays.append(dict(np.load(p)))
@@ -587,14 +601,22 @@ if __name__ == "__main__":
     )
     p.add_argument("--output_dir", type=str, default="./eval/adaptive_kalman")
     p.add_argument("--val_path", type=str, default=None, help="Single generic val root")
-    p.add_argument("--mot17_val_path", type=str, default=None)
-    # p.add_argument("--mot17_val_path", type=str, default="C:/Projects/.Datasets/MOT17/val")
+    p.add_argument("--det_dir", type=str, default=None, help="Detection dir for --val_path (real eval)")
+    _DS = "C:/Projects/.Datasets"; _DET = "C:/Projects/.Detections"
+    p.add_argument("--mot17_val_path", type=str, default=f"{_DS}/MOT17/val")
+    p.add_argument("--mot17_det_dir", type=str, default=f"{_DET}/MOT17")
     p.add_argument("--mot20_val_path", type=str, default=None)
-    # p.add_argument("--mot20_val_path", type=str, default="C:/Projects/.Datasets/MOT20/val")
-    # p.add_argument("--dancetrack_val_path", type=str, default=None)
-    p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
-    p.add_argument("--sportsmot_val_path", type=str, default=None)
-    # p.add_argument("--sportsmot_val_path", type=str, default="C:/Projects/.Datasets/SportsMOT/val")
+    # p.add_argument("--mot20_val_path", type=str, default=f"{_DS}/MOT20/val")
+    p.add_argument("--mot20_det_dir", type=str, default=f"{_DET}/MOT20")
+    p.add_argument("--dancetrack_val_path", type=str, default=f"{_DS}/DanceTrack/val")
+    p.add_argument("--dancetrack_det_dir", type=str, default=f"{_DET}/DanceTrack")
+    p.add_argument("--sportsmot_val_path", type=str, default=f"{_DS}/DanceTrack/val")
+    p.add_argument("--sportsmot_det_dir", type=str, default=f"{_DET}/SportsMOT")
+    p.add_argument("--match_iou", type=float, default=0.5, help="det<->GT IoU match threshold (real eval)")
+    p.add_argument("--min_observed_frac", type=float, default=0.0,
+                   help="Skip windows whose input context has < this fraction of real matched detections")
+    p.add_argument("--synthetic", action="store_true", default=False,
+                   help="Force the old GT+synthetic-noise dataset instead of real detections")
 
     p.add_argument(
         "--use_ckpt_seq_config",

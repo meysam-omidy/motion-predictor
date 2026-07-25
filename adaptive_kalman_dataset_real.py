@@ -65,11 +65,15 @@ class AdaptiveKalmanRealDataset(Dataset):
         match_iou: float,
         random_drop_prob: Optional[float],
         max_gap_norm: float,
+        min_observed_frac: float = 0.0,
     ) -> Tuple[list, list, list, list]:
+        # print(seq_path)
+        # print(det_path)
         sources, targets, gt_sources, gt_targets = [], [], [], []
         gt_path = os.path.join(seq_path, "gt", "gt.txt")
         if not (os.path.exists(gt_path) and os.path.exists(det_path)):
             return sources, targets, gt_sources, gt_targets
+        
 
         import configparser
         cfp = configparser.ConfigParser()
@@ -88,6 +92,14 @@ class AdaptiveKalmanRealDataset(Dataset):
 
         df = pd.read_csv(gt_path, header=None)
         df.columns = ["frame", "id", "x", "y", "w", "h", "conf", "class", "visibility"]
+        # MOT17/20 GT mixes non-pedestrian classes (7=static person, 9/4/2/8=...) and
+        # ignore regions (conf/consider flag = 0). Train only on considered pedestrians.
+        # DanceTrack/SportsMOT GT is all (conf=1, class=1) so this filter is a no-op there.
+        df = df[(df["conf"] == 1) & (df["class"] == 1)]
+        if len(df) == 0:
+            return sources, targets, gt_sources, gt_targets
+        
+        # print('1')
 
         for _, obj_df in df.groupby("id"):
             obj_df = obj_df.sort_values("frame").copy()
@@ -103,12 +115,17 @@ class AdaptiveKalmanRealDataset(Dataset):
             obs_box = np.zeros((n, 4), dtype=float)
             obs_score = np.zeros((n,), dtype=float)
             obs_flag = np.zeros((n,), dtype=bool)
+            # print(gt_box.shape)
             for k in range(n):
                 fr = int(frames_total[k])
                 if fr not in det_by_frame:
                     continue
                 dboxes_tlbr, dscores = det_by_frame[fr]
                 ious = _iou_one_to_many(_tlbr_from_center(gt_box[k]), dboxes_tlbr)
+                # print(ious)
+                # print(_tlbr_from_center(gt_box[k]))
+                # print(dboxes_tlbr)
+                # raise SystemExit
                 if len(ious) == 0:
                     continue
                 j = int(np.argmax(ious))
@@ -133,6 +150,13 @@ class AdaptiveKalmanRealDataset(Dataset):
                 seq_obs = copy(obs_norm[sl])
                 seq_score = copy(obs_score[sl])
                 seq_flag = copy(obs_flag[sl])
+
+                # Skip windows with too little REAL detection signal in the input
+                # context (measured on real matches, BEFORE synthetic drops): a mostly-
+                # gap window has nothing to condition on and biases Q toward "always
+                # uncertain". 0.0 = keep everything (original behavior).
+                if min_observed_frac > 0.0 and seq_flag[:seq_in_len].mean() < min_observed_frac:
+                    continue
 
                 # zero-out unmatched frames (real gaps) so gap features fire
                 seq_obs[~seq_flag] = 0.0
@@ -174,6 +198,7 @@ class AdaptiveKalmanRealDataset(Dataset):
         match_iou: float = 0.5,
         random_drop_prob: Optional[float] = 0.1,
         max_gap_norm: float = 30.0,
+        min_observed_frac: float = 0.0,
         dataset_weights: Optional[dict] = None,
     ) -> "AdaptiveKalmanRealDataset":
         sources, targets, gt_sources, gt_targets = [], [], [], []
@@ -189,6 +214,7 @@ class AdaptiveKalmanRealDataset(Dataset):
                     os.path.join(root, seq), os.path.join(det_root, seq + ".txt"),
                     seq_in_len, seq_out_len, seq_total_len, steps,
                     match_iou, random_drop_prob, max_gap_norm,
+                    min_observed_frac=min_observed_frac,
                 )
                 for _ in range(repeat):
                     sources.extend(s); targets.extend(t)

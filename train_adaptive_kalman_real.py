@@ -9,7 +9,7 @@ Example:
   python train_adaptive_kalman_real.py --epochs 60 --save_dir ./checkpoints/adaptive_kalman_real
 """
 from __future__ import annotations
-import argparse, json, math, random, time
+import argparse, json, math, os, random, time
 from pathlib import Path
 
 import numpy as np
@@ -34,13 +34,38 @@ def main(args):
 
     common = dict(seq_in_len=args.seq_in_len, seq_out_len=args.seq_out_len,
                   seq_total_len=args.seq_total_len, steps=args.steps,
-                  match_iou=args.match_iou, max_gap_norm=args.max_gap_norm)
+                  match_iou=args.match_iou, max_gap_norm=args.max_gap_norm,
+                  min_observed_frac=args.min_observed_frac)
+
+    # (name, train_path, val_path, detection_dir, oversample_weight). A dataset is
+    # used only if BOTH its data root and its detection dir exist (SportsMOT has no
+    # detections, so it is skipped automatically).
+    datasets = [
+        ("MOT17", args.mot17_train_path, args.mot17_val_path, args.mot17_det_dir, args.mot17_weight),
+        ("MOT20", args.mot20_train_path, args.mot20_val_path, args.mot20_det_dir, args.mot20_weight),
+        ("DanceTrack", args.dancetrack_train_path, args.dancetrack_val_path, args.dancetrack_det_dir, args.dancetrack_weight),
+        ("SportsMOT", args.sportsmot_train_path, args.sportsmot_val_path, args.sportsmot_det_dir, args.sportsmot_weight),
+    ]
+    train_roots, train_dets, val_roots, val_dets, weights = [], [], [], [], {}
+    for name, tr, va, det, w in datasets:
+        det_ok = det and os.path.isdir(det) and len(os.listdir(det)) > 0
+        if not det_ok:
+            print(f"  skip {name}: no detections at {det}")
+            continue
+        if tr and os.path.isdir(tr):
+            train_roots.append(tr); train_dets.append(det)
+            if w > 1:
+                weights[name] = w
+        if va and os.path.isdir(va):
+            val_roots.append(va); val_dets.append(det)
+    print(f"Datasets used: {[r.split('/')[-2] for r in train_roots]} | weights {weights}")
+
     train_ds = AdaptiveKalmanRealDataset.from_roots(
-        [args.dancetrack_train_path], [args.detections_dir],
-        random_drop_prob=args.random_drop_prob, **common)
+        train_roots, train_dets, random_drop_prob=args.random_drop_prob,
+        dataset_weights=weights or None, **common)
     val_ds = AdaptiveKalmanRealDataset.from_roots(
-        [args.dancetrack_val_path], [args.detections_dir],
-        random_drop_prob=args.val_random_drop_prob, **common)
+        val_roots, val_dets, random_drop_prob=args.val_random_drop_prob,
+        dataset_weights=None, **common)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise ValueError("Empty dataset — check paths / detections.")
@@ -103,14 +128,30 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--dancetrack_train_path", type=str, default="C:/Projects/.Datasets/DanceTrack/train")
-    p.add_argument("--dancetrack_val_path", type=str, default="C:/Projects/.Datasets/DanceTrack/val")
-    p.add_argument("--detections_dir", type=str, default="C:/Projects/.Detections/DanceTrack")
+    DS = "C:/Projects/.Datasets"; DET = "C:/Projects/.Detections"
+    p.add_argument("--mot17_train_path", type=str, default=f"{DS}/MOT17/train")
+    p.add_argument("--mot17_val_path", type=str, default=f"{DS}/MOT17/val")
+    p.add_argument("--mot17_det_dir", type=str, default=f"{DET}/MOT17")
+    p.add_argument("--mot17_weight", type=int, default=4)
+    p.add_argument("--mot20_train_path", type=str, default=f"{DS}/MOT20/train")
+    p.add_argument("--mot20_val_path", type=str, default=f"{DS}/MOT20/val")
+    p.add_argument("--mot20_det_dir", type=str, default=f"{DET}/MOT20")
+    p.add_argument("--mot20_weight", type=int, default=1)  # already sample-dominant (dense crowds)
+    p.add_argument("--dancetrack_train_path", type=str, default=f"{DS}/DanceTrack/train")
+    p.add_argument("--dancetrack_val_path", type=str, default=f"{DS}/DanceTrack/val")
+    p.add_argument("--dancetrack_det_dir", type=str, default=f"{DET}/DanceTrack")
+    p.add_argument("--dancetrack_weight", type=int, default=2)
+    p.add_argument("--sportsmot_train_path", type=str, default=f"{DS}/SportsMOT/train")
+    p.add_argument("--sportsmot_val_path", type=str, default=f"{DS}/SportsMOT/val")
+    p.add_argument("--sportsmot_det_dir", type=str, default=f"{DET}/SportsMOT")
+    p.add_argument("--sportsmot_weight", type=int, default=1)
     p.add_argument("--seq_in_len", type=int, default=30)
     p.add_argument("--seq_out_len", type=int, default=20)
     p.add_argument("--seq_total_len", type=int, default=50)
-    p.add_argument("--steps", type=int, default=3)
+    p.add_argument("--steps", type=int, default=5)
     p.add_argument("--match_iou", type=float, default=0.5)
+    p.add_argument("--min_observed_frac", type=float, default=0.0,
+                   help="Skip windows whose input context has < this fraction of REAL matched detections (0 = keep all)")
     p.add_argument("--random_drop_prob", type=float, default=0.15)
     p.add_argument("--val_random_drop_prob", type=float, default=0.1)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
@@ -130,12 +171,12 @@ if __name__ == "__main__":
     p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
     p.add_argument("--innov_obs_weight", type=float, default=0.25)
     p.add_argument("--conf_alpha", type=float, default=2.0)
-    p.add_argument("--batch_size", type=int, default=80)
+    p.add_argument("--batch_size", type=int, default=160)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_real")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_real_all")
     main(p.parse_args())
