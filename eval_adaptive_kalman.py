@@ -306,37 +306,69 @@ def calibration_bins(
 
 
 def verdict(summary: dict) -> dict:
-    """Simple pass/fail hints for quick reading."""
-    checks = {}
+    """
+    STRICT pass/fail hints — passing is meant to be hard, so a good verdict is
+    trustworthy. The decisive gate is beating the confidence-R prior (what the wbrt
+    heuristic effectively uses), not merely a constant variance.
+
+    IMPORTANT: every check is single-track *filter calibration* measured on CV
+    innovations. It is necessary but NOT sufficient for tracking quality — Q/R can
+    calibrate well and still lose association (AssA/HOTA). Treat STRONG as "now run
+    the tracker HOTA comparison", not as proof of a better tracker.
+    """
+    checks: dict = {}
+
+    def fin(x):
+        return isinstance(x, (int, float)) and math.isfinite(x)
 
     nll_m = summary.get("nll_model", float("inf"))
-    nll_f = summary.get("nll_fixed_var", float("inf"))
-    checks["beats_fixed_variance"] = nll_m < nll_f
+    nll_prior = summary.get("nll_conf_r_only", float("inf"))
+    nll_fixed = summary.get("nll_fixed_var", float("inf"))
 
-    rbp = summary.get("r_beats_prior", float("nan"))
-    checks["r_beats_prior"] = (rbp == rbp) and rbp > 0.5  # mean of 0/1 flags
+    # DECISIVE: beat the confidence-R prior (the real heuristic competitor) on the
+    # innovation NLL, by a real margin in nats — not a tie, not just a constant.
+    checks["beats_conf_r_prior"] = fin(nll_m) and fin(nll_prior) and nll_m < nll_prior - 0.02
+    checks["beats_fixed_variance"] = fin(nll_m) and fin(nll_fixed) and nll_m < nll_fixed - 0.02
 
-    calib = summary.get("calib_q_gap", summary.get("calib_ratio", 0.0))
-    checks["calibration_ok"] = (
-        calib == calib and 0.25 <= calib <= 4.0  # not NaN
-    )
+    # R matches detector error better than the prior, by an aggregate log-MAE margin.
+    mae_r = summary.get("mae_log_r", float("nan"))
+    mae_p = summary.get("mae_log_r_prior", float("nan"))
+    checks["r_beats_prior"] = fin(mae_r) and fin(mae_p) and mae_r < mae_p - 0.05
 
+    # Calibration mean(innov^2)/mean(var_q) on gaps — tight band around 1 (was 0.25..4).
+    calib = summary.get("calib_q_gap", summary.get("calib_ratio", float("nan")))
+    checks["calibration_tight"] = fin(calib) and 0.5 <= calib <= 2.0
+
+    # Predicted variance must track actual squared error, not just be positive noise.
+    cvi = summary.get("corr_var_innov_sq", float("nan"))
+    checks["var_tracks_innov_sq"] = fin(cvi) and cvi > 0.2
+
+    # Q rises with gap length; R falls with detection score — with real magnitude.
     cq = summary.get("corr_q_gap", float("nan"))
-    checks["q_increases_with_gap"] = not math.isnan(cq) and cq > 0.05
-
+    checks["q_increases_with_gap"] = fin(cq) and cq > 0.2
     cr = summary.get("corr_r_score", float("nan"))
-    checks["r_decreases_with_score"] = not math.isnan(cr) and cr < -0.05
+    checks["r_decreases_with_score"] = fin(cr) and cr < -0.2
 
+    # Q substantially larger in gaps than on confident observed frames (was 1.05x).
     gap_q = summary.get("mean_var_q_gap", 0.0)
     obs_q = summary.get("mean_var_q_observed", 0.0)
-    if gap_q and obs_q:
-        checks["q_higher_in_gaps"] = gap_q > obs_q * 1.05
-    else:
-        checks["q_higher_in_gaps"] = None
+    checks["q_higher_in_gaps"] = (gap_q > obs_q * 1.5) if (gap_q and obs_q) else None
 
     passed = sum(1 for v in checks.values() if v is True)
     total = sum(1 for v in checks.values() if v is not None)
+
+    # Tiered confidence: STRONG needs the decisive gates AND near-clean sweep, not a
+    # bare majority of loose checks.
+    must = ("beats_conf_r_prior", "calibration_tight", "var_tracks_innov_sq")
+    if all(checks.get(k) for k in must) and passed >= total - 1:
+        tier = "STRONG"
+    elif checks["beats_fixed_variance"] and passed >= max(3, total // 2):
+        tier = "PARTIAL"
+    else:
+        tier = "FAIL"
+
     checks["score"] = f"{passed}/{total}"
+    checks["tier"] = tier
     return checks
 
 
@@ -347,11 +379,13 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
     print(f"  Samples (steps):     {summary.get('n_steps', 0):,}")
     print(f"  Loss (total):        {summary.get('loss_total', 0):.4f}")
     print(f"  Innovation NLL:      {summary.get('nll_model', 0):.4f}")
+    print(f"    vs conf-R prior:   {summary.get('nll_conf_r_only', 0):.4f}  "
+          f"(the wbrt heuristic; {'BEATS it' if checks.get('beats_conf_r_prior') else 'loses/ties — decisive'})")
     print(f"    vs fixed-var:      {summary.get('nll_fixed_var', 0):.4f}  "
           f"(fixed={summary.get('fixed_var_used', float('nan')):.2e}; "
           f"{'better' if checks.get('beats_fixed_variance') else 'worse'})")
     print(f"  Calibration (Q,gap): {summary.get('calib_q_gap', summary.get('calib_ratio', float('nan'))):.3f}  "
-          f"(~1.0 ideal; {'ok' if checks.get('calibration_ok') else 'check'})")
+          f"(~1.0 ideal; {'ok' if checks.get('calibration_tight') else 'check'})")
     print(f"  Mean var Q / R:      {summary.get('mean_var_q', 0):.2e} / "
           f"{summary.get('mean_var_r', 0):.2e}")
     if "nll_observed" in summary:
@@ -367,14 +401,16 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
     print(f"  corr(Q, gap_len):    {summary.get('corr_q_gap', float('nan')):.3f}  "
           f"(expect positive)")
     print(f"  corr(var, innov_sq): {summary.get('corr_var_innov_sq', float('nan')):.3f}")
-    print(f"  Checks passed:       {checks.get('score', '?')}")
+    print(f"  Verdict:             {checks.get('tier', '?')}   (checks {checks.get('score', '?')})")
     for k, v in checks.items():
-        if k == "score":
+        if k in ("score", "tier"):
             continue
         if v is None:
             print(f"    {k}: n/a")
         else:
             print(f"    {k}: {'PASS' if v else 'FAIL'}")
+    print("  NOTE: this certifies single-track filter calibration on CV innovations,")
+    print("        NOT association (AssA/HOTA). STRONG => run the tracker HOTA compare.")
 
 
 def maybe_plot(output_dir: Path, name: str, summary: dict, calib_bins: List[dict]) -> None:
@@ -605,12 +641,11 @@ if __name__ == "__main__":
     _DS = "C:/Projects/.Datasets"; _DET = "C:/Projects/.Detections"
     p.add_argument("--mot17_val_path", type=str, default=f"{_DS}/MOT17/val")
     p.add_argument("--mot17_det_dir", type=str, default=f"{_DET}/MOT17")
-    p.add_argument("--mot20_val_path", type=str, default=None)
-    # p.add_argument("--mot20_val_path", type=str, default=f"{_DS}/MOT20/val")
+    p.add_argument("--mot20_val_path", type=str, default=f"{_DS}/MOT20/val")
     p.add_argument("--mot20_det_dir", type=str, default=f"{_DET}/MOT20")
     p.add_argument("--dancetrack_val_path", type=str, default=f"{_DS}/DanceTrack/val")
     p.add_argument("--dancetrack_det_dir", type=str, default=f"{_DET}/DanceTrack")
-    p.add_argument("--sportsmot_val_path", type=str, default=f"{_DS}/DanceTrack/val")
+    p.add_argument("--sportsmot_val_path", type=str, default=f"{_DS}/SportsMOT/val")
     p.add_argument("--sportsmot_det_dir", type=str, default=f"{_DET}/SportsMOT")
     p.add_argument("--match_iou", type=float, default=0.5, help="det<->GT IoU match threshold (real eval)")
     p.add_argument("--min_observed_frac", type=float, default=0.0,
@@ -647,9 +682,10 @@ if __name__ == "__main__":
         help="Baseline fixed variance; <=0 means use batch mean innov^2 (honest)",
     )
 
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--cpu", action="store_false")
+    p.add_argument("--cpu", action="store_true", default=False,
+                   help="force CPU even if CUDA is available (default: use CUDA when present)")
     p.add_argument("--plot", action="store_true", help="Save calibration/correlation plots")
 
     main(p.parse_args())

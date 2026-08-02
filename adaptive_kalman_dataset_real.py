@@ -16,6 +16,7 @@ loss, and training loop are unchanged:
 from __future__ import annotations
 
 import os
+from concurrent.futures import ProcessPoolExecutor
 from copy import copy
 from typing import List, Optional, Sequence, Tuple
 
@@ -24,10 +25,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from adaptive_kalman_dataset import (
-    FEATURE_DIM, SCORE_IDX, FRAMES_SINCE_IDX, OBSERVED_IDX,
-    _compute_motion_features, _attach_gap_features, _has_jump,
-)
+from adaptive_kalman_dataset import _has_jump, build_adaptive_kalman_features
 
 
 def _tlbr_from_center(b):  # b: (...,4) center xywh -> tlbr
@@ -49,6 +47,26 @@ def _iou_one_to_many(a, B):  # a:(4,) tlbr, B:(N,4) tlbr
     area_a = (a[2] - a[0]) * (a[3] - a[1])
     area_B = (B[:, 2] - B[:, 0]) * (B[:, 3] - B[:, 1])
     return inter / (area_a + area_B - inter + 1e-9)
+
+
+def _match_for_root(mapping: Optional[dict], root: str, default):
+    """Resolve a per-dataset value by substring-matching the dataset name in the root
+    path (e.g. {'MOT17': 2} matches '.../MOT17/train'). Falls back to `default`."""
+    if mapping:
+        r = root.replace("\\", "/").lower()
+        for key, val in mapping.items():
+            if key.lower() in r:
+                return val
+    return default
+
+
+def _load_sequence_task(task):
+    """Top-level worker for ProcessPoolExecutor (must be importable + picklable).
+    A deterministic per-sequence seed makes parallel gathers reproduce serial ones."""
+    seq_path, det_path, kw, seed = task
+    if seed is not None:
+        np.random.seed(seed)
+    return AdaptiveKalmanRealDataset.load_sequence(seq_path, det_path, **kw)
 
 
 class AdaptiveKalmanRealDataset(Dataset):
@@ -81,8 +99,9 @@ class AdaptiveKalmanRealDataset(Dataset):
         iw = float(cfp["Sequence"]["imWidth"]); ih = float(cfp["Sequence"]["imHeight"])
         borders = np.array([iw, ih, iw, ih], dtype=float)
 
-        # detections: frame, x1, y1, x2, y2, score  (tlbr, pixel)
-        det = np.loadtxt(det_path, delimiter=",")
+        # detections: frame, x1, y1, x2, y2, score  (tlbr, pixel).
+        # pandas' C parser is ~10-50x faster than np.loadtxt on large det files.
+        det = pd.read_csv(det_path, header=None).to_numpy(dtype=float)
         if det.ndim == 1:
             det = det[None, :]
         det_by_frame = {}
@@ -158,26 +177,23 @@ class AdaptiveKalmanRealDataset(Dataset):
                 if min_observed_frac > 0.0 and seq_flag[:seq_in_len].mean() < min_observed_frac:
                     continue
 
-                # zero-out unmatched frames (real gaps) so gap features fire
-                seq_obs[~seq_flag] = 0.0
-                seq_score[~seq_flag] = 0.0
-
-                # optional extra random drops (enrich occlusion/Q learning)
+                # observed mask = real detection matched AND not randomly dropped.
+                # (No need to pre-zero the boxes: the gap-safe builder ignores the
+                #  content of unobserved rows entirely.)
+                obs_mask = seq_flag.copy()
                 if random_drop_prob and random_drop_prob > 0:
                     drop = np.random.random(size=seq_total_len) < random_drop_prob
-                    seq_obs[drop] = 0.0
-                    seq_score[drop] = 0.0
+                    obs_mask &= ~drop
 
-                # features from observed detection boxes; GT features from clean GT
-                enh = np.zeros((seq_total_len, FEATURE_DIM), dtype=np.float32)
-                enh[:, :12] = _compute_motion_features(seq_obs)
-                enh[:, SCORE_IDX] = seq_score
-                _attach_gap_features(enh, max_gap_norm)
-
-                enh_gt = np.zeros((seq_total_len, FEATURE_DIM), dtype=np.float32)
-                enh_gt[:, :12] = _compute_motion_features(seq_gt)
-                enh_gt[:, SCORE_IDX] = 1.0
-                _attach_gap_features(enh_gt, max_gap_norm)
+                # gap-safe features: derivatives crossing a gap are zeroed, so this
+                # matches the tracker's inference builder exactly. GT is fully observed.
+                enh = build_adaptive_kalman_features(seq_obs, seq_score, obs_mask, max_gap_norm)
+                enh_gt = build_adaptive_kalman_features(
+                    seq_gt,
+                    np.ones(seq_total_len, dtype=float),
+                    np.ones(seq_total_len, dtype=bool),
+                    max_gap_norm,
+                )
 
                 sources.append(enh[:seq_in_len])
                 targets.append(enh[-seq_out_len:])
@@ -200,25 +216,45 @@ class AdaptiveKalmanRealDataset(Dataset):
         max_gap_norm: float = 30.0,
         min_observed_frac: float = 0.0,
         dataset_weights: Optional[dict] = None,
+        dataset_steps: Optional[dict] = None,
+        num_workers: int = 0,
     ) -> "AdaptiveKalmanRealDataset":
-        sources, targets, gt_sources, gt_targets = [], [], [], []
+        # One task per sequence, resolving per-dataset stride (`dataset_steps`) and
+        # oversample factor (`dataset_weights`). `steps` is the fallback stride.
+        tasks, repeats = [], []
         for root, det_root in zip(root_dirs, detections_dirs):
-            repeat = 1
-            if dataset_weights:
-                for key, factor in dataset_weights.items():
-                    if key.lower() in root.replace("\\", "/").lower():
-                        repeat = int(factor); break
-            seqs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+            repeat = int(_match_for_root(dataset_weights, root, 1))
+            step_r = int(_match_for_root(dataset_steps, root, steps))
+            seqs = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
             for seq in seqs:
-                s, t, gs, gt = cls.load_sequence(
-                    os.path.join(root, seq), os.path.join(det_root, seq + ".txt"),
-                    seq_in_len, seq_out_len, seq_total_len, steps,
-                    match_iou, random_drop_prob, max_gap_norm,
-                    min_observed_frac=min_observed_frac,
+                kw = dict(
+                    seq_in_len=seq_in_len, seq_out_len=seq_out_len,
+                    seq_total_len=seq_total_len, steps=step_r,
+                    match_iou=match_iou, random_drop_prob=random_drop_prob,
+                    max_gap_norm=max_gap_norm, min_observed_frac=min_observed_frac,
                 )
-                for _ in range(repeat):
-                    sources.extend(s); targets.extend(t)
-                    gt_sources.extend(gs); gt_targets.extend(gt)
+                tasks.append((
+                    os.path.join(root, seq),
+                    os.path.join(det_root, seq + ".txt"),
+                    kw,
+                    1_000_003 + len(tasks),  # deterministic per-sequence seed
+                ))
+                repeats.append(repeat)
+
+        # Sequences are independent -> gather them across processes. (0 = auto.)
+        if num_workers in (None, 0):
+            num_workers = min(os.cpu_count() or 1, 10)
+        if num_workers > 1 and len(tasks) > 1:
+            with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                results = list(ex.map(_load_sequence_task, tasks))
+        else:
+            results = [_load_sequence_task(t) for t in tasks]
+
+        sources, targets, gt_sources, gt_targets = [], [], [], []
+        for (s, t, gs, gt), repeat in zip(results, repeats):
+            for _ in range(repeat):
+                sources.extend(s); targets.extend(t)
+                gt_sources.extend(gs); gt_targets.extend(gt)
 
         obj = cls()
         obj.sources = torch.tensor(np.array(sources), dtype=torch.float32)

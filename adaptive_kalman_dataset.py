@@ -99,24 +99,71 @@ def _attach_gap_features(seq_enhanced: np.ndarray, max_gap_norm: float = 30.0) -
         seq_enhanced[i, OBSERVED_IDX] = 1.0 if observed else 0.0
 
 
+def build_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm: float = 30.0):
+    """
+    Canonical GAP-SAFE 15-D feature builder for the adaptive Kalman Q/R model.
+    Layout: [x, y, w, h, vx..vh, ax..ah, det_score, frames_since_obs, is_observed].
+
+    This is the single source of truth for the feature representation. An identical
+    copy lives in the tracker at
+    Observation-Centric-.../utils.py::compute_adaptive_kalman_features — the two MUST
+    stay byte-for-byte equivalent or the model sees a different distribution at
+    inference than it was trained on.
+
+    Contract:
+      - position     kept only on observed rows (unobserved -> 0)
+      - velocity[i]     only when rows i and i-1 are both observed (else 0)
+      - acceleration[i] only when rows i, i-1, i-2 are all observed (else 0)
+    Any derivative crossing a gap is zeroed, so features depend ONLY on real
+    observations and never on whatever fills a gap (KF pred at inference, zero here).
+    """
+    bboxes = np.asarray(bboxes, dtype=float).reshape(-1, 4)
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    observed = np.asarray(observed, dtype=bool).reshape(-1)
+    n = len(bboxes)
+    feat = np.zeros((n, FEATURE_DIM), dtype=np.float32)
+    for i in range(n):
+        if not observed[i]:
+            continue
+        feat[i, :4] = bboxes[i]
+        feat[i, SCORE_IDX] = scores[i]
+        if i >= 1 and observed[i - 1]:
+            feat[i, 4:8] = bboxes[i] - bboxes[i - 1]
+            if i >= 2 and observed[i - 2]:
+                feat[i, 8:12] = (bboxes[i] - bboxes[i - 1]) - (bboxes[i - 1] - bboxes[i - 2])
+
+    gap = 0.0
+    for i in range(n):
+        if observed[i]:
+            gap = 0.0
+        else:
+            gap += 1.0
+        feat[i, FRAMES_SINCE_IDX] = min(gap / max_gap_norm, 1.0)
+        feat[i, OBSERVED_IDX] = 1.0 if observed[i] else 0.0
+    return feat
+
+
 def _enhance_sequence(
     seq: np.ndarray,
     seq_noised: np.ndarray,
     use_motion_features: bool,
     max_gap_norm: float,
+    drop_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if use_motion_features:
-        seq_enhanced = np.zeros((len(seq), FEATURE_DIM), dtype=np.float32)
-        seq_enhanced[:, :12] = _compute_motion_features(seq_noised)
-        seq_enhanced_gt = np.zeros((len(seq), FEATURE_DIM), dtype=np.float32)
-        seq_enhanced_gt[:, :12] = _compute_motion_features(seq)
-    else:
+    if not use_motion_features:
         raise ValueError("AdaptiveKalmanDataset requires use_motion_features=True")
 
-    seq_enhanced[:, SCORE_IDX] = np.diag(_batch_iou(seq, seq_noised))
-    seq_enhanced_gt[:, SCORE_IDX] = 1.0
-    _attach_gap_features(seq_enhanced, max_gap_norm)
-    _attach_gap_features(seq_enhanced_gt, max_gap_norm)
+    n = len(seq)
+    scores = np.diag(_batch_iou(seq, seq_noised))
+    observed = np.ones(n, dtype=bool)
+    if drop_mask is not None:
+        observed &= ~np.asarray(drop_mask, dtype=bool)
+
+    # Same gap-safe builder as the real dataset and the tracker's inference path.
+    seq_enhanced = build_adaptive_kalman_features(seq_noised, scores, observed, max_gap_norm)
+    seq_enhanced_gt = build_adaptive_kalman_features(
+        seq, np.ones(n, dtype=float), np.ones(n, dtype=bool), max_gap_norm
+    )
     return seq_enhanced, seq_enhanced_gt
 
 
@@ -189,16 +236,12 @@ class  AdaptiveKalmanDataset(Dataset):
                 box_noise_mask = np.random.random(size=(seq.shape[0], 1)) < noise_prob
                 seq_noised = np.where(box_noise_mask, seq + noise, seq)
 
-                seq_enhanced, seq_enhanced_gt = _enhance_sequence(
-                    seq, seq_noised, True, max_gap_norm
-                )
-
+                drop_mask = None
                 if random_drop_prob is not None and random_drop_prob > 0:
-                    drop_mask = np.random.random(size=len(seq_enhanced)) < random_drop_prob
-                    seq_enhanced[drop_mask, SCORE_IDX] = 0.0
-                    seq_enhanced[drop_mask, :4] = 0.0
-                    seq_enhanced[drop_mask, 4:12] = 0.0
-                    _attach_gap_features(seq_enhanced, max_gap_norm)
+                    drop_mask = np.random.random(size=len(seq)) < random_drop_prob
+                seq_enhanced, seq_enhanced_gt = _enhance_sequence(
+                    seq, seq_noised, True, max_gap_norm, drop_mask
+                )
 
                 frames = frames_total[i : i + seq_total_len]
 
