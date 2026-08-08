@@ -198,6 +198,114 @@ class PositionalEncoding(nn.Module):
 
 
 
+def _kf_matrices(device, dtype):
+    Fm = torch.tensor(
+        [[1, 0, 0, 0, 1, 0, 0], [0, 1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 0, 0, 1],
+         [0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 1, 0],
+         [0, 0, 0, 0, 0, 0, 1]], device=device, dtype=dtype)
+    Hm = torch.tensor(
+        [[1, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0],
+         [0, 0, 1, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]], device=device, dtype=dtype)
+    return Fm, Hm
+
+
+def _xywh_to_z(b, eps=1e-6):
+    x, y = b[..., 0], b[..., 1]
+    w = b[..., 2].clamp(min=eps); h = b[..., 3].clamp(min=eps)
+    return torch.stack([x, y, w * h, w / h], dim=-1)
+
+
+def _z_to_xywh(z, eps=1e-6):
+    x, y = z[..., 0], z[..., 1]
+    s = z[..., 2].clamp(min=eps); r = z[..., 3].clamp(min=eps)
+    return torch.stack([x, y, torch.sqrt(s * r), torch.sqrt(s / r)], dim=-1)
+
+
+def _var_xywh_to_zdiag(var_xywh, w, h, eps=1e-6):
+    """Same normalized xywh->(x,y,s,r) variance mapping the tracker uses (iw=ih=1)."""
+    w = w.clamp(min=eps); h = h.clamp(min=eps)
+    vx, vy, vw, vh = var_xywh[:, 0], var_xywh[:, 1], var_xywh[:, 2], var_xywh[:, 3]
+    vs = h ** 2 * vw + w ** 2 * vh
+    vr = vw / h ** 2 + w ** 2 * vh / h ** 4
+    return torch.stack([vx, vy, vs.clamp(min=1e-9), vr.clamp(min=1e-9)], dim=-1)
+
+
+def differentiable_kf_track_loss(
+    log_var_q, log_var_r, meas_xywh, gt_xywh, observed,
+    var_floor=VAR_FLOOR, vel_floor=0.01, gap_weight=3.0,
+):
+    """
+    Batched, differentiable SORT Kalman filter (same 7-D (x,y,s,r,vx,vy,vs) state, F/H
+    and xywh->z variance mapping as the tracker) run forward over the window: feed the
+    real detections as measurements (skip update on gap frames), and penalize the filter's
+    OUTPUT box (posterior when observed, prior during gaps) against GT.
+
+    This supervises Q and R *jointly through the Kalman gain* K = P Ht (H P Ht + R)^-1 — the
+    network must emit (Q, R) whose gain fuses prediction + detection toward GT. Captures the
+    Q/R co-adaptation the separate innovation-NLL / R-supervision terms cannot. Keep those
+    terms on as anchors: this objective only constrains the Q/R *ratio*, not absolute scale.
+    """
+    B, T, _ = gt_xywh.shape
+    if T < 3:
+        return gt_xywh.new_tensor(0.0), gt_xywh.new_tensor(0.0)
+    dtype = log_var_q.dtype
+    Fm, Hm = _kf_matrices(gt_xywh.device, dtype)
+    var_q = exp_var(log_var_q, var_floor)
+    var_r = exp_var(log_var_r, var_floor)
+    gt_z = _xywh_to_z(gt_xywh)
+
+    x = gt_z.new_zeros(B, 7, 1)
+    x[:, :4, 0] = gt_z[:, 1]
+    x[:, 4:, 0] = (gt_z[:, 1] - gt_z[:, 0])[:, :3]
+    P = torch.diag_embed(gt_z.new_tensor([10., 10., 10., 10., 1e4, 1e4, 1e4])
+                         ).unsqueeze(0).expand(B, 7, 7).contiguous()
+    I7 = torch.eye(7, device=x.device, dtype=dtype)
+    I4 = torch.eye(4, device=x.device, dtype=dtype)
+
+    losses, weights = [], []
+    for t in range(2, T):
+        w_t, h_t = gt_xywh[:, t, 2], gt_xywh[:, t, 3]
+        q7 = torch.cat([_var_xywh_to_zdiag(var_q[:, t], w_t, h_t),
+                        x.new_full((B, 3), vel_floor)], dim=-1)
+        Q = torch.diag_embed(q7)
+        R = torch.diag_embed(_var_xywh_to_zdiag(var_r[:, t], w_t, h_t))
+
+        x = Fm @ x
+        P = Fm @ P @ Fm.transpose(-1, -2) + Q
+
+        obs_t = observed[:, t].view(B, 1, 1)
+        z = _xywh_to_z(meas_xywh[:, t]).unsqueeze(-1)
+        y = z - Hm @ x
+        S = Hm @ P @ Hm.transpose(-1, -2) + R + 1e-6 * I4
+        K = P @ Hm.transpose(-1, -2) @ torch.linalg.inv(S)
+        x = torch.where(obs_t, x + K @ y, x)
+        P = torch.where(obs_t, (I7 - K @ Hm) @ P, P)
+
+        out = _z_to_xywh(x[:, :4, 0])
+        l = F.smooth_l1_loss(out, gt_xywh[:, t], beta=0.05, reduction="none").mean(-1)
+        wgt = torch.where(observed[:, t], out.new_tensor(1.0), out.new_tensor(gap_weight))
+        losses.append(l * wgt); weights.append(wgt)
+
+    total = torch.stack(losses).sum()
+    denom = torch.stack(weights).sum().clamp(min=1.0)
+    return total / denom, total.detach() / denom
+
+    
+def nfc(n_layers, input_dim, output_dim, dropout):
+    components = []
+    dims = torch.linspace(input_dim, output_dim, n_layers + 1)
+    dims = [int(x) for x in dims]
+    for i in range(len(dims) - 2):
+        components.extend([
+            nn.Linear(dims[i], dims[i+1]),
+            nn.LayerNorm(dims[i+1]),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+        ])
+    components.append(nn.Linear(dims[-2], dims[-1]))
+    return nn.Sequential(*components)
+
+
 class AdaptiveKalmanLoss(nn.Module):
     """
     Context-split Kalman noise loss (thesis-aligned):
@@ -229,6 +337,8 @@ class AdaptiveKalmanLoss(nn.Module):
         innov_obs_weight: float = 0.25,
         conf_alpha: float = 2.0,
         var_floor: float = VAR_FLOOR,
+        kf_track_coeff: float = 0.0,
+        kf_gap_weight: float = 3.0,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
@@ -239,6 +349,10 @@ class AdaptiveKalmanLoss(nn.Module):
         self.innov_obs_weight = innov_obs_weight
         self.conf_alpha = conf_alpha
         self.var_floor = var_floor
+        # Joint Q/R supervision via a differentiable Kalman filter (0 = off).
+        # Keep innovation_coeff / r_supervise_coeff > 0 as scale anchors when using this.
+        self.kf_track_coeff = kf_track_coeff
+        self.kf_gap_weight = kf_gap_weight
 
     def forward(
         self,
@@ -326,12 +440,24 @@ class AdaptiveKalmanLoss(nn.Module):
         easy = scores * observed.float()
         loss_q_easy = (var_q * easy).mean()
 
+        # Joint Q/R supervision through a differentiable Kalman gain (optional).
+        if self.kf_track_coeff > 0:
+            loss_kf_track, kf_track_val = differentiable_kf_track_loss(
+                log_var_q, log_var_r,
+                trg[..., :4], gt_trg[..., :4], observed.squeeze(-1),
+                var_floor=self.var_floor, gap_weight=self.kf_gap_weight,
+            )
+        else:
+            loss_kf_track = innovations.new_tensor(0.0)
+            kf_track_val = innovations.new_tensor(0.0)
+
         loss = (
             self.innovation_coeff * loss_innov
             + self.r_supervise_coeff * loss_r
             + self.q_gap_coeff * loss_q_gap
             + self.q_gap_trend_coeff * loss_q_gap_trend
             + self.q_easy_coeff * loss_q_easy
+            + self.kf_track_coeff * loss_kf_track
         )
 
         with torch.no_grad():
@@ -346,6 +472,7 @@ class AdaptiveKalmanLoss(nn.Module):
                 "loss_q_gap": float(loss_q_gap),
                 "loss_q_gap_trend": float(loss_q_gap_trend),
                 "loss_q_easy": float(loss_q_easy),
+                "loss_kf_track": float(kf_track_val),
                 "mean_var_q": float(var_q.mean()),
                 "mean_var_r": float(var_r.mean()),
                 "mean_innov_sq": float(innov_sq.mean()),
@@ -365,7 +492,7 @@ class AdaptiveKalmanLoss(nn.Module):
 class _AdaptiveKalmanHead(nn.Module):
     """Shared Q/R output heads with confidence-R prior on R."""
 
-    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
+    def __init__(self, hidden_dim: int, dropout: float, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
         super().__init__()
         self.conf_alpha = conf_alpha
         # Q head output is interpreted directly as log(var_q) by the loss.
@@ -373,15 +500,28 @@ class _AdaptiveKalmanHead(nn.Module):
         # between low-motion (MOT17 ~6e-7) and high-motion (DanceTrack ~6e-5)
         # process noise, so the head does not have to travel far in either
         # direction and low-motion data is not stuck high early in training.
-        self.q_head = nn.Linear(hidden_dim, 4)
-        nn.init.constant_(self.q_head.bias, q_init_bias)
-        nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
+        
+        self.q_head = nfc(
+            n_layers=3,
+            input_dim=hidden_dim,
+            output_dim=4,
+            dropout=dropout * 0.5
+        )
+        self.r_residual_head = nfc(
+            n_layers=3,
+            input_dim=hidden_dim,
+            output_dim=4,
+            dropout=dropout * 0.5
+        )
+        # self.q_head = nn.Linear(hidden_dim, 4)
+        # nn.init.constant_(self.q_head.bias, q_init_bias)
+        # nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
         # Additive log-space delta on the confidence prior. Zero init → start at
         # prior; signed delta lets R go above or below the prior (unlike the old
         # prior_var + exp(logit) floor which froze loss_r when prior was too high).
-        self.r_residual_head = nn.Linear(hidden_dim, 4)
-        nn.init.zeros_(self.r_residual_head.weight)
-        nn.init.zeros_(self.r_residual_head.bias)
+        # self.r_residual_head = nn.Linear(hidden_dim, 4)
+        # nn.init.zeros_(self.r_residual_head.weight)
+        # nn.init.zeros_(self.r_residual_head.bias)
 
     def forward(
         self, hidden: torch.Tensor, scores: torch.Tensor
@@ -391,6 +531,7 @@ class _AdaptiveKalmanHead(nn.Module):
         delta = self.r_residual_head(hidden).clamp(-6.0, 6.0)
         log_var_r = (log_r_prior + delta).clamp(-16.0, 8.0)
         return log_var_q, log_var_r
+
 
 
 class AdaptiveKalmanTransformer(nn.Module):
@@ -414,16 +555,11 @@ class AdaptiveKalmanTransformer(nn.Module):
         self.d_model = d_model
         self.conf_alpha = conf_alpha
 
-        self.in_fc = nn.Sequential(
-            nn.Linear(input_dim, d_model // 4),
-            nn.LayerNorm(d_model // 4),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 4, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 2, d_model),
+        self.in_fc = nfc(
+            n_layers=3,
+            input_dim=input_dim,
+            output_dim=d_model,
+            dropout=dropout * 0.5
         )
         self.pos_enc = PositionalEncoding(d_model)
         self.transformer = nn.TransformerEncoder(
@@ -439,7 +575,7 @@ class AdaptiveKalmanTransformer(nn.Module):
             num_layers=num_layers,
             norm=nn.LayerNorm(d_model),
         )
-        self.head = _AdaptiveKalmanHead(d_model, conf_alpha=conf_alpha)
+        self.head = _AdaptiveKalmanHead(d_model, dropout, conf_alpha=conf_alpha)
 
     @staticmethod
     def _causal_mask(src_len: int, ctx_len: int, device: torch.device) -> torch.Tensor:

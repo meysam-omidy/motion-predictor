@@ -115,7 +115,8 @@ def main(args):
         innovation_coeff=args.innovation_coeff, r_supervise_coeff=args.r_supervise_coeff,
         q_gap_coeff=args.q_gap_coeff, q_easy_coeff=args.q_easy_coeff,
         q_gap_trend_coeff=args.q_gap_trend_coeff, innov_obs_weight=args.innov_obs_weight,
-        conf_alpha=args.conf_alpha)
+        conf_alpha=args.conf_alpha,
+        kf_track_coeff=args.kf_track_coeff, kf_gap_weight=args.kf_gap_weight)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
                                   patience=max(1, args.patience // 3))
@@ -195,8 +196,8 @@ if __name__ == "__main__":
     p.add_argument("--sportsmot_det_dir", type=str, default=f"{DET}/SportsMOT")
     p.add_argument("--sportsmot_weight", type=int, default=1)
     p.add_argument("--seq_in_len", type=int, default=30)
-    p.add_argument("--seq_out_len", type=int, default=30)
-    p.add_argument("--seq_total_len", type=int, default=60)
+    p.add_argument("--seq_out_len", type=int, default=70)
+    p.add_argument("--seq_total_len", type=int, default=100)
     p.add_argument("--steps", type=int, default=5, help="default sliding-window stride (fallback)")
     # Per-dataset stride overrides — larger stride = fewer windows, to balance the
     # very different sample counts across datasets (e.g. stride up the large ones).
@@ -209,14 +210,14 @@ if __name__ == "__main__":
     p.add_argument("--min_observed_frac", type=float, default=0.0,
                    help="Skip windows whose input context has < this fraction of REAL matched detections (0 = keep all)")
     p.add_argument("--random_drop_prob", type=float, default=0.15)
-    p.add_argument("--val_random_drop_prob", type=float, default=0.1)
+    p.add_argument("--val_random_drop_prob", type=float, default=0.15)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
     p.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "lstm"])
-    p.add_argument("--d_model", type=int, default=128)
-    p.add_argument("--nhead", type=int, default=16)
+    p.add_argument("--d_model", type=int, default=64)
+    p.add_argument("--nhead", type=int, default=8)
     p.add_argument("--num_layers", type=int, default=4)
-    p.add_argument("--dim_ff", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--dim_ff", type=int, default=128)
+    p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument("--lstm_hidden_dim", type=int, default=256)
     p.add_argument("--lstm_num_layers", type=int, default=1)
     p.add_argument("--teacher_forcing_ratio", type=float, default=1)
@@ -225,18 +226,23 @@ if __name__ == "__main__":
     p.add_argument("--q_gap_coeff", type=float, default=0.0)
     p.add_argument("--q_easy_coeff", type=float, default=0.01)
     p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
+    p.add_argument("--kf_track_coeff", type=float, default=1.0,
+                   help="weight of the differentiable-Kalman-gain loss (joint Q/R vs GT); "
+                        "0 = off. Keep innovation_coeff/r_supervise_coeff > 0 as anchors.")
+    p.add_argument("--kf_gap_weight", type=float, default=3.0,
+                   help="upweight gap frames in the KF-track loss (where coasting/Q matters)")
     p.add_argument("--innov_obs_weight", type=float, default=0.25)
     p.add_argument("--conf_alpha", type=float, default=2.0)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=60)
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=3e-4)
-    p.add_argument("--patience", type=int, default=20)
+    p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gather_workers", type=int, default=0,
                    help="processes for dataset gathering (0=auto min(cpu,8), 1=serial)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints/adaptive_kalman_real_low_data_light_transformer")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_low_data_light_transformer_lr_new_kftrackoff")
     p.add_argument("--resume", type=str, default=None,
                    help="path to a checkpoint (e.g. .../best_model.pth) to continue training from. "
                         "Loads model weights (adopting its architecture args); also restores "
