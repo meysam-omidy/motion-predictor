@@ -262,6 +262,7 @@ def build_model(args, device: torch.device) -> nn.Module:
         d_model=args.d_model,
         dropout=0.0,  # deterministic grads for diagnosis
         conf_alpha=args.conf_alpha,
+        max_gap_norm=args.max_gap_norm,
     )
     if args.model_type == "transformer":
         model_kw.update(
@@ -315,6 +316,13 @@ def _zero_grads(model: nn.Module) -> None:
         p.grad = None
 
 
+def _grad_norm(module: nn.Module) -> float:
+    grads = [p.grad.detach().norm() for p in module.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+    return float(torch.stack(grads).norm())
+
+
 def run_term_attribution(
     model: nn.Module,
     criterion: AdaptiveKalmanLoss,
@@ -357,17 +365,15 @@ def run_term_attribution(
         _zero_grads(model)
         log_q, log_r = model(src, trg)
         innovations = build_cv_innovations(gt_src, gt_trg, observed=trg[..., 14])
-        loss, _ = crit(log_q, log_r, innovations, trg, gt_trg)
+        loss, _ = crit(log_q, log_r, innovations, trg, gt_trg, gt_src)
         if float(loss) == 0.0:
             out[name] = {"loss": 0.0, "q_head_grad_norm": 0.0, "r_head_grad_norm": 0.0}
             continue
         loss.backward()
-        q_g = model.head.q_head.weight.grad
-        r_g = model.head.r_residual_head.weight.grad
         out[name] = {
             "loss": float(loss.detach()),
-            "q_head_grad_norm": float(q_g.norm()) if q_g is not None else 0.0,
-            "r_head_grad_norm": float(r_g.norm()) if r_g is not None else 0.0,
+            "q_head_grad_norm": _grad_norm(model.head.q_head),
+            "r_head_grad_norm": _grad_norm(model.head.r_residual_head),
         }
     return out
 
@@ -407,7 +413,7 @@ def diagnose(args) -> int:
 
     log_q, log_r = model(src, trg)
     innovations = build_cv_innovations(gt_src, gt_trg, observed=trg[..., 14])
-    loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
+    loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
 
     print("\n=== Forward ===")
     print(f"sample: {sample_info}")
@@ -572,6 +578,7 @@ def parse_args():
     p.add_argument("--sportsmot_train_path", type=str, default=None)
 
     p.add_argument("--seq_in_len", type=int, default=30)
+    p.add_argument("--max_gap_norm", type=float, default=30.0)
     p.add_argument("--seq_out_len", type=int, default=20)
     p.add_argument("--seq_total_len", type=int, default=50)
     p.add_argument("--steps", type=int, default=4)

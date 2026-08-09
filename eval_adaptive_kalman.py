@@ -87,6 +87,10 @@ def load_model_and_config(
     checkpoint_path: Path, device: torch.device, model_type: Optional[str] = None
 ) -> Tuple[torch.nn.Module, dict]:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(ckpt, dict) and ckpt.get("adaptive_qr_version", 1) < 2:
+        raise ValueError(
+            "Checkpoint predates the causal two-stage Q/R interface; retrain it first."
+        )
     train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     mtype = model_type or ckpt.get("model_type") or train_args.get(
         "model_type", "transformer"
@@ -97,6 +101,7 @@ def load_model_and_config(
         d_model=train_args.get("d_model", 256),
         dropout=train_args.get("dropout", 0.1),
         conf_alpha=train_args.get("conf_alpha", 2.0),
+        max_gap_norm=train_args.get("max_gap_norm", 30.0),
     )
     if mtype == "transformer":
         model_kw.update(
@@ -142,7 +147,7 @@ def evaluate_batch(
         gt_src, gt_trg, observed=trg_step[:, :, OBSERVED_IDX]
     )
 
-    loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step)
+    loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step, gt_src)
 
     # Both heads emit true log-variances; recover with exp (matches AdaptiveKalmanLoss).
     log_q_s = log_q.clamp(min=-20.0, max=10.0)

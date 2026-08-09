@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import math
 import os
-import random
 from typing import Optional, Tuple
 
 import torch
@@ -118,6 +117,24 @@ def build_cv_innovations(
         # True base always advances with ground truth.
         t_prev_prev, t_prev = t_prev, cur
     return torch.stack(innovations, dim=1)
+
+
+def build_prediction_gaps(
+    src: torch.Tensor,
+    trg: torch.Tensor,
+    max_gap_norm: float,
+) -> torch.Tensor:
+    """Prediction-time gap for every target step, using past information only.
+
+    Historical feature column 13 describes the frame stored in that row.  Q is
+    requested one frame later, before the next measurement is known, so its gap
+    is the previous row's gap plus one frame.  This is the training counterpart
+    of ``Track.age`` in the tracker.
+    """
+    if max_gap_norm <= 0:
+        raise ValueError("max_gap_norm must be positive")
+    previous = torch.cat([src[:, -1:, 13:14], trg[:, :-1, 13:14]], dim=1)
+    return (previous + 1.0 / float(max_gap_norm)).clamp(0.0, 1.0)
 
 
 def _log_var_match(pred_var: torch.Tensor, target_var: torch.Tensor) -> torch.Tensor:
@@ -231,7 +248,7 @@ def _var_xywh_to_zdiag(var_xywh, w, h, eps=1e-6):
 
 
 def differentiable_kf_track_loss(
-    log_var_q, log_var_r, meas_xywh, gt_xywh, observed,
+    log_var_q, log_var_r, meas_xywh, gt_src_xywh, gt_xywh, observed,
     var_floor=VAR_FLOOR, vel_floor=0.01, gap_weight=3.0,
 ):
     """
@@ -246,24 +263,25 @@ def differentiable_kf_track_loss(
     terms on as anchors: this objective only constrains the Q/R *ratio*, not absolute scale.
     """
     B, T, _ = gt_xywh.shape
-    if T < 3:
+    if T < 1 or gt_src_xywh.size(1) < 2:
         return gt_xywh.new_tensor(0.0), gt_xywh.new_tensor(0.0)
     dtype = log_var_q.dtype
     Fm, Hm = _kf_matrices(gt_xywh.device, dtype)
     var_q = exp_var(log_var_q, var_floor)
     var_r = exp_var(log_var_r, var_floor)
     gt_z = _xywh_to_z(gt_xywh)
+    gt_src_z = _xywh_to_z(gt_src_xywh)
 
     x = gt_z.new_zeros(B, 7, 1)
-    x[:, :4, 0] = gt_z[:, 1]
-    x[:, 4:, 0] = (gt_z[:, 1] - gt_z[:, 0])[:, :3]
+    x[:, :4, 0] = gt_src_z[:, -1]
+    x[:, 4:, 0] = (gt_src_z[:, -1] - gt_src_z[:, -2])[:, :3]
     P = torch.diag_embed(gt_z.new_tensor([10., 10., 10., 10., 1e4, 1e4, 1e4])
                          ).unsqueeze(0).expand(B, 7, 7).contiguous()
     I7 = torch.eye(7, device=x.device, dtype=dtype)
     I4 = torch.eye(4, device=x.device, dtype=dtype)
 
     losses, weights = [], []
-    for t in range(2, T):
+    for t in range(T):
         w_t, h_t = gt_xywh[:, t, 2], gt_xywh[:, t, 3]
         q7 = torch.cat([_var_xywh_to_zdiag(var_q[:, t], w_t, h_t),
                         x.new_full((B, 3), vel_floor)], dim=-1)
@@ -361,6 +379,7 @@ class AdaptiveKalmanLoss(nn.Module):
         innovations: torch.Tensor,
         trg: torch.Tensor,
         gt_trg: torch.Tensor,
+        gt_src: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         # log_var_q / log_var_r are true log-variances. Use exp — never softplus —
         # so gradients stay well-conditioned (no softplus saturation).
@@ -441,10 +460,10 @@ class AdaptiveKalmanLoss(nn.Module):
         loss_q_easy = (var_q * easy).mean()
 
         # Joint Q/R supervision through a differentiable Kalman gain (optional).
-        if self.kf_track_coeff > 0:
+        if self.kf_track_coeff > 0 and gt_src is not None:
             loss_kf_track, kf_track_val = differentiable_kf_track_loss(
                 log_var_q, log_var_r,
-                trg[..., :4], gt_trg[..., :4], observed.squeeze(-1),
+                trg[..., :4], gt_src[..., :4], gt_trg[..., :4], observed.squeeze(-1),
                 var_floor=self.var_floor, gap_weight=self.kf_gap_weight,
             )
         else:
@@ -490,7 +509,7 @@ class AdaptiveKalmanLoss(nn.Module):
 
 
 class _AdaptiveKalmanHead(nn.Module):
-    """Shared Q/R output heads with confidence-R prior on R."""
+    """Two-stage heads: causal Q and current-measurement-conditioned R."""
 
     def __init__(self, hidden_dim: int, dropout: float, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
         super().__init__()
@@ -503,7 +522,7 @@ class _AdaptiveKalmanHead(nn.Module):
         
         self.q_head = nfc(
             n_layers=3,
-            input_dim=hidden_dim,
+            input_dim=hidden_dim + 1,
             output_dim=4,
             dropout=dropout * 0.5
         )
@@ -523,14 +542,13 @@ class _AdaptiveKalmanHead(nn.Module):
         # nn.init.zeros_(self.r_residual_head.weight)
         # nn.init.zeros_(self.r_residual_head.bias)
 
-    def forward(
-        self, hidden: torch.Tensor, scores: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        log_var_q = self.q_head(hidden)
+    def predict_q(self, hidden: torch.Tensor, prediction_gap: torch.Tensor) -> torch.Tensor:
+        return self.q_head(torch.cat([hidden, prediction_gap], dim=-1))
+
+    def predict_r(self, hidden: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         log_r_prior = confidence_log_r_prior(scores, alpha=self.conf_alpha)
         delta = self.r_residual_head(hidden).clamp(-6.0, 6.0)
-        log_var_r = (log_r_prior + delta).clamp(-16.0, 8.0)
-        return log_var_q, log_var_r
+        return (log_r_prior + delta).clamp(-16.0, 8.0)
 
 
 
@@ -549,11 +567,13 @@ class AdaptiveKalmanTransformer(nn.Module):
         dim_ff: int = 1024,
         dropout: float = 0.1,
         conf_alpha: float = 2.0,
+        max_gap_norm: float = 30.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
         self.conf_alpha = conf_alpha
+        self.max_gap_norm = float(max_gap_norm)
 
         self.in_fc = nfc(
             n_layers=3,
@@ -609,30 +629,45 @@ class AdaptiveKalmanTransformer(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
-        ctx: torch.Tensor,
+        trg: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        src: (B, S, F) history, ctx: (B, T, F) future context (noisy features, no GT leak).
+        Q consumes shifted context (only information through t-1). R consumes the
+        current matched measurement at t. This mirrors the tracker's two stages.
         Returns log_var_q, log_var_r: (B, T, 4) each.
         """
-        hidden = self._encode(src, ctx, src_key_padding_mask)
-        scores = ctx[..., 12:13]
-        return self.head(hidden, scores)
+        q_ctx = torch.cat([src[:, -1:, :], trg[:, :-1, :]], dim=1)
+        prediction_gap = build_prediction_gaps(src, trg, self.max_gap_norm)
+        q_hidden = self._encode(src, q_ctx, src_key_padding_mask)
+        r_hidden = self._encode(src, trg, src_key_padding_mask)
+        log_q = self.head.predict_q(q_hidden, prediction_gap)
+        log_r = self.head.predict_r(r_hidden, trg[..., 12:13])
+        return log_q, log_r
 
     @torch.no_grad()
-    def predict_noise(
+    def predict_q(
         self,
         src: torch.Tensor,
+        prediction_gap: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Single-step Q/R from observation history (tracker predict/update)."""
-        b = src.size(0)
+    ) -> torch.Tensor:
+        """Q for the next transition, before the current measurement exists."""
         ctx = src[:, -1:, :].clone()
         hidden = self._encode(src, ctx, src_key_padding_mask)
-        scores = ctx[..., 12:13]
-        log_q, log_r = self.head(hidden[:, -1:, :], scores)
-        return log_q[:, 0, :], log_r[:, 0, :]
+        gap = prediction_gap.reshape(src.size(0), 1, 1).to(src)
+        return self.head.predict_q(hidden[:, -1:, :], gap)[:, 0, :]
+
+    @torch.no_grad()
+    def predict_r(
+        self,
+        src: torch.Tensor,
+        measurement: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """R for a matched current measurement, immediately before KF update."""
+        hidden = self._encode(src, measurement, src_key_padding_mask)
+        return self.head.predict_r(hidden[:, -1:, :], measurement[..., 12:13])[:, 0, :]
 
     def train_one_epoch(
         self,
@@ -657,7 +692,7 @@ class AdaptiveKalmanTransformer(nn.Module):
             innovations = build_cv_innovations(
                 gt_src, gt_trg, observed=trg[..., 14]
             )
-            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
+            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -694,7 +729,7 @@ class AdaptiveKalmanTransformer(nn.Module):
                 innovations = build_cv_innovations(
                     gt_src, gt_trg, observed=trg[..., 14]
                 )
-                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
+                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v
@@ -723,10 +758,12 @@ class AdaptiveKalmanLSTM(nn.Module):
         dropout: float = 0.1,
         conf_alpha: float = 2.0,
         teacher_forcing_ratio: float = 0.5,
+        max_gap_norm: float = 30.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.max_gap_norm = float(max_gap_norm)
 
         self.in_fc = nn.Sequential(
             nn.Linear(input_dim, d_model // 4),
@@ -746,7 +783,9 @@ class AdaptiveKalmanLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = _AdaptiveKalmanHead(hidden_dim, conf_alpha=conf_alpha)
+        self.head = _AdaptiveKalmanHead(
+            hidden_dim, dropout, conf_alpha=conf_alpha
+        )
 
     def forward(
         self,
@@ -754,36 +793,37 @@ class AdaptiveKalmanLSTM(nn.Module):
         ctx: torch.Tensor,
         teacher_forcing_ratio: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if teacher_forcing_ratio is None:
-            teacher_forcing_ratio = self.teacher_forcing_ratio
-
         src_embed = self.in_fc(src)
-        _, (h, c) = self.lstm(src_embed)
+        _, (hq, cq) = self.lstm(src_embed)
+        _, (hr, cr) = self.lstm(src_embed)
 
-        prev = ctx[:, 0:1, :]
+        q_ctx = torch.cat([src[:, -1:, :], ctx[:, :-1, :]], dim=1)
+        prediction_gaps = build_prediction_gaps(src, ctx, self.max_gap_norm)
         log_qs, log_rs = [], []
         for t in range(ctx.size(1)):
-            inp = self.in_fc(prev)
-            out, (h, c) = self.lstm(inp, (h, c))
-            score = prev[:, :, 12:13]
-            lq, lr = self.head(out, score)
-            log_qs.append(lq)
-            log_rs.append(lr)
-            if t + 1 < ctx.size(1):
-                use_teacher = random.random() < teacher_forcing_ratio
-                prev = ctx[:, t + 1 : t + 2, :] if use_teacher else prev
+            q_out, (hq, cq) = self.lstm(self.in_fc(q_ctx[:, t:t + 1]), (hq, cq))
+            r_cur = ctx[:, t:t + 1]
+            r_out, (hr, cr) = self.lstm(self.in_fc(r_cur), (hr, cr))
+            log_qs.append(self.head.predict_q(q_out, prediction_gaps[:, t:t + 1]))
+            log_rs.append(self.head.predict_r(r_out, r_cur[..., 12:13]))
 
         return torch.cat(log_qs, dim=1), torch.cat(log_rs, dim=1)
 
     @torch.no_grad()
-    def predict_noise(self, src: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def predict_q(self, src: torch.Tensor, prediction_gap: torch.Tensor) -> torch.Tensor:
         src_embed = self.in_fc(src)
         _, (h, c) = self.lstm(src_embed)
         prev = src[:, -1:, :]
         out, (h, c) = self.lstm(self.in_fc(prev), (h, c))
-        score = prev[:, :, 12:13]
-        log_q, log_r = self.head(out, score)
-        return log_q[:, 0, :], log_r[:, 0, :]
+        gap = prediction_gap.reshape(src.size(0), 1, 1).to(src)
+        return self.head.predict_q(out, gap)[:, 0, :]
+
+    @torch.no_grad()
+    def predict_r(self, src: torch.Tensor, measurement: torch.Tensor) -> torch.Tensor:
+        src_embed = self.in_fc(src)
+        _, (h, c) = self.lstm(src_embed)
+        out, (h, c) = self.lstm(self.in_fc(measurement), (h, c))
+        return self.head.predict_r(out, measurement[..., 12:13])[:, 0, :]
 
     def train_one_epoch(
         self,
@@ -807,7 +847,7 @@ class AdaptiveKalmanLSTM(nn.Module):
             innovations = build_cv_innovations(
                 gt_src, gt_trg, observed=trg[..., 14]
             )
-            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
+            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -846,7 +886,7 @@ class AdaptiveKalmanLSTM(nn.Module):
                 innovations = build_cv_innovations(
                     gt_src, gt_trg, observed=trg[..., 14]
                 )
-                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg)
+                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v

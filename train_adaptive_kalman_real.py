@@ -27,6 +27,23 @@ def set_seed(s):
     torch.manual_seed(s); torch.cuda.manual_seed_all(s); np.random.seed(s); random.seed(s)
 
 
+LOSS_COMPONENTS = (
+    ("loss_innov", "innov"),
+    ("loss_r", "r"),
+    ("loss_q_gap", "q_gap"),
+    ("loss_q_gap_trend", "q_trend"),
+    ("loss_q_easy", "q_easy"),
+    ("loss_kf_track", "kf_track"),
+)
+
+
+def format_loss_components(metrics):
+    return " | ".join(
+        f"{label} {metrics.get(key, float('nan')):.6f}"
+        for key, label in LOSS_COMPONENTS
+    )
+
+
 def main(args):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,7 +106,19 @@ def main(args):
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and ckpt.get("adaptive_qr_version", 1) < 2:
+            raise ValueError(
+                "Cannot resume a pre-v2 checkpoint: the causal two-stage Q/R "
+                "architecture requires retraining."
+            )
         ck_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+        for k in ("seq_in_len", "max_gap_norm"):
+            if k in ck_args and getattr(args, k) != ck_args[k]:
+                raise ValueError(
+                    f"Resume mismatch for {k}: CLI={getattr(args, k)} but "
+                    f"checkpoint={ck_args[k]}. These values define the causal "
+                    "training/inference contract."
+                )
         for k in ("model_type", "d_model", "nhead", "num_layers", "dim_ff",
                   "lstm_hidden_dim", "lstm_num_layers"):
             if k in ck_args and getattr(args, k, None) != ck_args[k]:
@@ -97,7 +126,7 @@ def main(args):
                 setattr(args, k, ck_args[k])
 
     model_kw = dict(input_dim=FEATURE_DIM, d_model=args.d_model, dropout=args.dropout,
-                    conf_alpha=args.conf_alpha)
+                    conf_alpha=args.conf_alpha, max_gap_norm=args.max_gap_norm)
     if args.model_type == "transformer":
         model_kw.update(nhead=args.nhead, num_layers=args.num_layers, dim_ff=args.dim_ff)
     else:
@@ -143,18 +172,32 @@ def main(args):
 
     save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
     patience = 0
-    history = {"train_loss": [], "val_loss": []}
+    history = {
+        "train_loss": [], "val_loss": [],
+        "train_metrics": [], "val_metrics": [],
+    }
 
     end_epoch = start_epoch + args.epochs - 1
     for epoch in range(start_epoch, end_epoch + 1):
         t0 = time.time()
         train_loss, tm = model.train_one_epoch(train_loader, optimizer, criterion, str(device))
         val_loss, vm = model.evaluate(val_loader, criterion, str(device))
-        history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
-        print(f"Epoch {epoch}/{end_epoch} | train {train_loss:.4f} "
-              f"(innov {tm.get('loss_innov',0):.4f}, r {tm.get('loss_r',0):.4f}) | "
-              f"val {val_loss:.4f} (var_r {vm.get('mean_var_r',float('nan')):.2e}, "
-              f"var_q {vm.get('mean_var_q',0):.2e}) | lr {scheduler.get_last_lr()} | {time.time()-t0:.1f}s")
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_metrics"].append(tm)
+        history["val_metrics"].append(vm)
+        lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch}/{end_epoch} | train {train_loss:.6f} | "
+            f"val {val_loss:.6f} | lr {lr:.2e} | {time.time()-t0:.1f}s\n"
+            f"  train losses | {format_loss_components(tm)}\n"
+            f"  val losses   | {format_loss_components(vm)}\n"
+            f"  val stats    | var_q {vm.get('mean_var_q', float('nan')):.3e} | "
+            f"var_r {vm.get('mean_var_r', float('nan')):.3e} | "
+            f"calib_q {vm.get('calib_q_gap', float('nan')):.4f} | "
+            f"gap_frac {vm.get('frac_gap', float('nan')):.4f} | "
+            f"r_supervised {vm.get('frac_r_supervised', float('nan')):.4f}"
+        )
         if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
             print("Non-finite loss — stopping."); break
         scheduler.step(val_loss)
@@ -163,8 +206,9 @@ def main(args):
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
-                        "val_loss": val_loss, "args": vars(args),
-                        "feature_dim": FEATURE_DIM, "model_type": args.model_type},
+                        "val_loss": val_loss, "val_metrics": vm, "args": vars(args),
+                        "feature_dim": FEATURE_DIM, "model_type": args.model_type,
+                        "adaptive_qr_version": 2, "history_len": args.seq_in_len},
                        save_dir / "best_model.pth")
             print(f"  -> best saved (val {val_loss:.4f})")
         else:
@@ -242,7 +286,7 @@ if __name__ == "__main__":
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gather_workers", type=int, default=0,
                    help="processes for dataset gathering (0=auto min(cpu,8), 1=serial)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_low_data_light_transformer_lr_new_kftrackoff")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_low_data_light_transformer_lr_new_kftrackoff2")
     p.add_argument("--resume", type=str, default=None,
                    help="path to a checkpoint (e.g. .../best_model.pth) to continue training from. "
                         "Loads model weights (adopting its architecture args); also restores "

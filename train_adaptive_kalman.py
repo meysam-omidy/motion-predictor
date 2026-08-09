@@ -38,6 +38,23 @@ from adaptive_kalman_dataset import AdaptiveKalmanDataset, FEATURE_DIM
 from adaptive_kalman_motion import AdaptiveKalmanLoss, build_adaptive_kalman_model
 
 
+LOSS_COMPONENTS = (
+    ("loss_innov", "innov"),
+    ("loss_r", "r"),
+    ("loss_q_gap", "q_gap"),
+    ("loss_q_gap_trend", "q_trend"),
+    ("loss_q_easy", "q_easy"),
+    ("loss_kf_track", "kf_track"),
+)
+
+
+def format_loss_components(metrics):
+    return " | ".join(
+        f"{label} {metrics.get(key, float('nan')):.6f}"
+        for key, label in LOSS_COMPONENTS
+    )
+
+
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -124,6 +141,7 @@ def main(args):
         d_model=args.d_model,
         dropout=args.dropout,
         conf_alpha=args.conf_alpha,
+        max_gap_norm=args.max_gap_norm,
     )
     if args.model_type == "transformer":
         model_kw.update(
@@ -190,13 +208,15 @@ def main(args):
         lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch}/{args.epochs} | "
-            f"train {train_loss:.4f} (innov {train_metrics.get('loss_innov', 0):.4f}, "
-            f"r {train_metrics.get('loss_r', 0):.4f}, q_gap {train_metrics.get('loss_q_gap', 0):.4f}, "
-            f"trend {train_metrics.get('loss_q_gap_trend', 0):.4f}) | "
-            f"val {val_loss:.4f} (q_gap {val_metrics.get('loss_q_gap', 0):.4f}, "
-            f"var_q {val_metrics.get('mean_var_q', 0):.2e}, calib_q {val_metrics.get('calib_q_gap', float('nan')):.2f}, "
-            f"r_frac {val_metrics.get('frac_r_supervised', 0):.2f}) | "
-            f"lr {lr:.2e} | {time.time()-t0:.1f}s"
+            f"train {train_loss:.6f} | val {val_loss:.6f} | "
+            f"lr {lr:.2e} | {time.time()-t0:.1f}s\n"
+            f"  train losses | {format_loss_components(train_metrics)}\n"
+            f"  val losses   | {format_loss_components(val_metrics)}\n"
+            f"  val stats    | var_q {val_metrics.get('mean_var_q', float('nan')):.3e} | "
+            f"var_r {val_metrics.get('mean_var_r', float('nan')):.3e} | "
+            f"calib_q {val_metrics.get('calib_q_gap', float('nan')):.4f} | "
+            f"gap_frac {val_metrics.get('frac_gap', float('nan')):.4f} | "
+            f"r_supervised {val_metrics.get('frac_r_supervised', float('nan')):.4f}"
         )
 
         if not math.isfinite(train_loss) or not math.isfinite(val_loss):
@@ -220,6 +240,8 @@ def main(args):
                 "val_metrics": val_metrics,
                 "args": vars(args),
                 "feature_dim": FEATURE_DIM,
+                "adaptive_qr_version": 2,
+                "history_len": args.seq_in_len,
                 "model_type": args.model_type,
             }
             torch.save(ckpt, save_dir / "best_model.pth")
