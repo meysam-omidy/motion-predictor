@@ -41,11 +41,12 @@ from adaptive_kalman_dataset_real import AdaptiveKalmanRealDataset
 from adaptive_kalman_motion import (
     AdaptiveKalmanLoss,
     AdaptiveKalmanLSTM,
+    VAR_FLOOR,
     build_adaptive_kalman_model,
     build_cv_innovations,
+    build_prediction_gaps,
     confidence_log_r_prior,
     exp_var,
-    softplus_var,
     _gaussian_nll_logvar,
 )
 
@@ -91,13 +92,14 @@ def load_model_and_config(
         raise ValueError(
             "Checkpoint predates the causal two-stage Q/R interface; retrain it first."
         )
-    train_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    mtype = model_type or ckpt.get("model_type") or train_args.get(
-        "model_type", "transformer"
-    )
+    is_checkpoint = isinstance(ckpt, dict)
+    train_args = ckpt.get("args", {}) if is_checkpoint else {}
+    mtype = model_type or (
+        ckpt.get("model_type") if is_checkpoint else None
+    ) or train_args.get("model_type", "transformer")
 
     model_kw = dict(
-        input_dim=ckpt.get("feature_dim", FEATURE_DIM),
+        input_dim=ckpt.get("feature_dim", FEATURE_DIM) if is_checkpoint else FEATURE_DIM,
         d_model=train_args.get("d_model", 256),
         dropout=train_args.get("dropout", 0.1),
         conf_alpha=train_args.get("conf_alpha", 2.0),
@@ -122,6 +124,21 @@ def load_model_and_config(
         model.load_state_dict(ckpt)
     model.eval()
     return model, train_args
+
+
+def build_eval_criterion(train_args: dict, conf_alpha: float) -> AdaptiveKalmanLoss:
+    """Rebuild the checkpoint's loss so ``loss_total`` matches training semantics."""
+    return AdaptiveKalmanLoss(
+        innovation_coeff=train_args.get("innovation_coeff", 1.0),
+        r_supervise_coeff=train_args.get("r_supervise_coeff", 2.0),
+        q_gap_coeff=train_args.get("q_gap_coeff", 0.0),
+        q_easy_coeff=train_args.get("q_easy_coeff", 0.01),
+        q_gap_trend_coeff=train_args.get("q_gap_trend_coeff", 1.0),
+        innov_obs_weight=train_args.get("innov_obs_weight", 0.25),
+        conf_alpha=conf_alpha,
+        kf_track_coeff=train_args.get("kf_track_coeff", 0.0),
+        kf_gap_weight=train_args.get("kf_gap_weight", 3.0),
+    )
 
 
 @torch.no_grad()
@@ -150,8 +167,8 @@ def evaluate_batch(
     loss, loss_parts = criterion(log_q, log_r, innovations, trg_step, gt_step, gt_src)
 
     # Both heads emit true log-variances; recover with exp (matches AdaptiveKalmanLoss).
-    log_q_s = log_q.clamp(min=-20.0, max=10.0)
-    log_r_s = log_r.clamp(min=-20.0, max=10.0)
+    log_q_s = log_q.clamp(min=-20.0, max=8.0)
+    log_r_s = log_r.clamp(min=-20.0, max=8.0)
     var_q = exp_var(log_q_s)
     var_r = exp_var(log_r_s)
     innov_sq = innovations.pow(2)
@@ -170,8 +187,17 @@ def evaluate_batch(
 
     observed = trg_step[:, :, OBSERVED_IDX] > 0.5
     gap = ~observed
-    meas_sq = (trg_step[..., :4] - gt_step[..., :4]).pow(2).clamp(min=1e-6)
-    r_mask = observed.unsqueeze(-1) & (meas_sq.max(dim=-1, keepdim=True).values > 1e-5)
+    # Q is predicted before target-frame t's measurement exists. Its causal
+    # input is the previous gap plus one frame, matching model.forward(), not
+    # trg_step's current gap feature (which reveals t's observation outcome).
+    max_gap_norm = float(getattr(model, "max_gap_norm", 30.0))
+    prediction_gap = build_prediction_gaps(src, trg, max_gap_norm).squeeze(-1)
+    after_gap = prediction_gap > (1.0 / max_gap_norm + 1e-7)
+    meas_sq = (trg_step[..., :4] - gt_step[..., :4]).pow(2).clamp(min=VAR_FLOOR)
+    # Match AdaptiveKalmanLoss: assess R wherever a real detection has measurable error.
+    r_mask = observed.unsqueeze(-1) & (
+        meas_sq.max(dim=-1, keepdim=True).values > VAR_FLOOR * 10
+    )
     if r_mask.any():
         log_meas = torch.log(meas_sq[r_mask.expand_as(meas_sq)].clamp(min=1e-8))
         mae_r = (log_r_s.expand_as(var_r)[r_mask.expand_as(var_r)] - log_meas).abs().mean()
@@ -230,13 +256,25 @@ def evaluate_batch(
         )
         batch_metrics["mean_var_q_gap"] = var_q[gap_m].mean().item()
 
+    # Q may know that the tracker was already coasting, but it cannot know a
+    # newly missed current measurement. These are the aligned Q diagnostics.
+    if after_gap.any():
+        after_gap_m = after_gap.unsqueeze(-1).expand_as(var_q)
+        batch_metrics["mean_var_q_after_gap"] = var_q[after_gap_m].mean().item()
+    if (~after_gap).any():
+        baseline_m = (~after_gap).unsqueeze(-1).expand_as(var_q)
+        batch_metrics["mean_var_q_baseline"] = var_q[baseline_m].mean().item()
+
     arrays = {
         "innov_sq": innov_sq.reshape(-1).cpu().numpy(),
         "var_total": var_q.reshape(-1).cpu().numpy(),
         "var_q": var_q.reshape(-1).cpu().numpy(),
         "var_r": var_r.reshape(-1).cpu().numpy(),
         "scores": trg_step[..., SCORE_IDX].reshape(-1).cpu().numpy(),
+        # Current gap is retained for descriptive diagnostics. Q correlation
+        # uses prediction_gap below because that is the available signal.
         "gap_len": trg_step[:, :, FRAMES_SINCE_IDX].reshape(-1).cpu().numpy(),
+        "prediction_gap": prediction_gap.reshape(-1).cpu().numpy(),
         "observed": observed.reshape(-1).cpu().numpy().astype(bool),
     }
     return batch_metrics, arrays
@@ -257,7 +295,8 @@ def compute_correlations(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
     if len(arrays["var_r"]) != n_steps * step:
         step = max(1, len(arrays["var_r"]) // max(n_steps, 1))
     scores = arrays["scores"]
-    gap = arrays["gap_len"]
+    current_gap = arrays["gap_len"]
+    prediction_gap = arrays.get("prediction_gap", current_gap)
     observed = arrays["observed"].astype(bool)
     var_r = arrays["var_r"].reshape(-1, step).mean(axis=1)
     var_q = arrays["var_q"].reshape(-1, step).mean(axis=1)
@@ -276,7 +315,10 @@ def compute_correlations(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
         "corr_r_score": corr_r,
         "corr_r_one_minus_score": corr_r_oms,
         "corr_r_score_all": _pearson(scores, var_r),
-        "corr_q_gap": _pearson(gap, var_q),
+        # Q at target t is based on history through t-1, so its causal gap is
+        # prediction_gap rather than the current frame's observation gap.
+        "corr_q_gap": _pearson(prediction_gap, var_q),
+        "corr_q_current_gap": _pearson(current_gap, var_q),
         "corr_var_innov_sq": _pearson(var_total, innov_sq),
     }
 
@@ -355,9 +397,13 @@ def verdict(summary: dict) -> dict:
     checks["r_decreases_with_score"] = fin(cr) and cr < -0.2
 
     # Q substantially larger in gaps than on confident observed frames (was 1.05x).
-    gap_q = summary.get("mean_var_q_gap", 0.0)
-    obs_q = summary.get("mean_var_q_observed", 0.0)
-    checks["q_higher_in_gaps"] = (gap_q > obs_q * 1.5) if (gap_q and obs_q) else None
+    # Q can react only to a gap already present in its input history, not to a
+    # newly missed current-frame measurement.
+    after_gap_q = summary.get("mean_var_q_after_gap", 0.0)
+    baseline_q = summary.get("mean_var_q_baseline", 0.0)
+    checks["q_higher_in_gaps"] = (
+        after_gap_q > baseline_q * 1.5
+    ) if (after_gap_q and baseline_q) else None
 
     passed = sum(1 for v in checks.values() if v is True)
     total = sum(1 for v in checks.values() if v is not None)
@@ -396,15 +442,15 @@ def print_summary(name: str, summary: dict, checks: dict) -> None:
     if "nll_observed" in summary:
         print(f"  NLL observed / gap:  {summary['nll_observed']:.4f} / "
               f"{summary.get('nll_gap', float('nan')):.4f}")
-        print(f"  Mean var Q obs/gap:  {summary.get('mean_var_q_observed', 0):.2e} / "
-              f"{summary.get('mean_var_q_gap', 0):.2e}")
+    print(f"  Mean Q base/after-gap: {summary.get('mean_var_q_baseline', float('nan')):.2e} / "
+          f"{summary.get('mean_var_q_after_gap', float('nan')):.2e}")
     print(f"  R log-MAE vs prior:  {summary.get('mae_log_r', float('nan')):.4f} / "
           f"{summary.get('mae_log_r_prior', float('nan')):.4f}  "
           f"({'better' if checks.get('r_beats_prior') else 'worse/same'})")
     print(f"  corr(R, score|obs):  {summary.get('corr_r_score', float('nan')):.3f}  "
           f"(expect negative)")
-    print(f"  corr(Q, gap_len):    {summary.get('corr_q_gap', float('nan')):.3f}  "
-          f"(expect positive)")
+    print(f"  corr(Q, prediction gap): {summary.get('corr_q_gap', float('nan')):.3f}  "
+          f"(expect positive; current-gap {summary.get('corr_q_current_gap', float('nan')):.3f})")
     print(f"  corr(var, innov_sq): {summary.get('corr_var_innov_sq', float('nan')):.3f}")
     print(f"  Verdict:             {checks.get('tier', '?')}   (checks {checks.get('score', '?')})")
     for k, v in checks.items():
@@ -450,12 +496,11 @@ def maybe_plot(output_dir: Path, name: str, summary: dict, calib_bins: List[dict
         axes[0].set_xlabel("Detection score")
         axes[0].set_ylabel("Predicted var R")
         axes[0].set_title("R vs score")
-        axes[1].scatter(
-            data["gap_len"], data["var_q"], s=1, alpha=0.15, c="darkorange"
-        )
-        axes[1].set_xlabel("Frames since obs (norm)")
+        q_gap = data["prediction_gap"] if "prediction_gap" in data else data["gap_len"]
+        axes[1].scatter(q_gap, data["var_q"], s=1, alpha=0.15, c="darkorange")
+        axes[1].set_xlabel("Prediction-time gap (norm)")
         axes[1].set_ylabel("Predicted var Q")
-        axes[1].set_title("Q vs gap length")
+        axes[1].set_title("Q vs causal prediction gap")
         fig.suptitle(name)
         fig.tight_layout()
         fig.savefig(output_dir / f"correlations_{name.replace(' ', '_')}.png", dpi=120)
@@ -518,7 +563,7 @@ def main(args) -> None:
 
     model, train_args = load_model_and_config(ckpt_path, device, args.model_type)
     conf_alpha = args.conf_alpha or train_args.get("conf_alpha", 2.0)
-    criterion = AdaptiveKalmanLoss(conf_alpha=conf_alpha)
+    criterion = build_eval_criterion(train_args, conf_alpha)
 
     if train_args and args.use_ckpt_seq_config:
         for key in (
@@ -530,10 +575,18 @@ def main(args) -> None:
         ):
             if key in train_args:
                 setattr(args, key, train_args[key])
-        # Keep eval-specific augmentation (do not copy training drop/noise)
+        # Match the checkpoint's validation-time augmentation, not its training
+        # augmentation. This makes loss_total comparable with validation logs.
+        if "val_random_drop_prob" in train_args:
+            args.random_drop_prob = train_args["val_random_drop_prob"]
+        if "val_noise_prob" in train_args:
+            args.noise_prob = train_args["val_noise_prob"]
+        if "val_noise_coeff" in train_args:
+            args.noise_coeff = train_args["val_noise_coeff"]
         print(
-            f"Sequence config from checkpoint: "
-            f"in={args.seq_in_len}, out={args.seq_out_len}, total={args.seq_total_len}"
+            f"Validation config from checkpoint: "
+            f"in={args.seq_in_len}, out={args.seq_out_len}, total={args.seq_total_len}, "
+            f"drop={args.random_drop_prob}"
         )
 
     # (name, val_root, detection_dir). Real eval requires a detection dir; if it is
@@ -675,10 +728,11 @@ if __name__ == "__main__":
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--noise_prob", type=float, default=0.2)
     p.add_argument("--noise_coeff", type=float, default=0.1)
-    p.add_argument("--random_drop_prob", type=float, default=0.2)
+    p.add_argument("--random_drop_prob", type=float, default=0.3)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
 
-    p.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "lstm"])
+    p.add_argument("--model_type", type=str, default=None, choices=["transformer", "lstm"],
+                   help="Override the model type recorded in the checkpoint")
     p.add_argument("--conf_alpha", type=float, default=None)
     p.add_argument(
         "--fixed_var",
