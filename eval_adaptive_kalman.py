@@ -104,6 +104,7 @@ def load_model_and_config(
         dropout=train_args.get("dropout", 0.1),
         conf_alpha=train_args.get("conf_alpha", 2.0),
         max_gap_norm=train_args.get("max_gap_norm", 30.0),
+        kalman_head_layers=train_args.get("kalman_head_layers", 3),
     )
     if mtype == "transformer":
         model_kw.update(
@@ -696,7 +697,7 @@ if __name__ == "__main__":
     p.add_argument("--output_dir", type=str, default="./eval/adaptive_kalman")
     p.add_argument("--val_path", type=str, default=None, help="Single generic val root")
     p.add_argument("--det_dir", type=str, default=None, help="Detection dir for --val_path (real eval)")
-    _DS = "C:/Projects/.Datasets"; _DET = "C:/Projects/.Detections"
+    _DS = "C:/Projects/.Datasets"; _DET = "C:/Projects/.Detections/YOLOXx"
     p.add_argument("--mot17_val_path", type=str, default=f"{_DS}/MOT17/val")
     p.add_argument("--mot17_det_dir", type=str, default=f"{_DET}/MOT17")
     p.add_argument("--mot20_val_path", type=str, default=f"{_DS}/MOT20/val")

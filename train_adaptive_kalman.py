@@ -142,6 +142,7 @@ def main(args):
         dropout=args.dropout,
         conf_alpha=args.conf_alpha,
         max_gap_norm=args.max_gap_norm,
+        kalman_head_layers=args.kalman_head_layers,
     )
     if args.model_type == "transformer":
         model_kw.update(
@@ -322,6 +323,8 @@ if __name__ == "__main__":
     p.add_argument("--num_layers", type=int, default=6)
     p.add_argument("--dim_ff", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--kalman_head_layers", type=int, default=3,
+                   help="number of Linear projections in each Q/R Kalman-noise head (>= 1)")
     p.add_argument("--lstm_hidden_dim", type=int, default=256)
     p.add_argument("--lstm_num_layers", type=int, default=1)
     p.add_argument("--teacher_forcing_ratio", type=float, default=1)

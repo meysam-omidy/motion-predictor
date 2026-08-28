@@ -120,13 +120,14 @@ def main(args):
                     "training/inference contract."
                 )
         for k in ("model_type", "d_model", "nhead", "num_layers", "dim_ff",
-                  "lstm_hidden_dim", "lstm_num_layers"):
+                  "lstm_hidden_dim", "lstm_num_layers", "kalman_head_layers"):
             if k in ck_args and getattr(args, k, None) != ck_args[k]:
                 print(f"  [resume] override {k}: {getattr(args, k, None)} -> {ck_args[k]} (from checkpoint)")
                 setattr(args, k, ck_args[k])
 
     model_kw = dict(input_dim=FEATURE_DIM, d_model=args.d_model, dropout=args.dropout,
-                    conf_alpha=args.conf_alpha, max_gap_norm=args.max_gap_norm)
+                    conf_alpha=args.conf_alpha, max_gap_norm=args.max_gap_norm,
+                    kalman_head_layers=args.kalman_head_layers)
     if args.model_type == "transformer":
         model_kw.update(nhead=args.nhead, num_layers=args.num_layers, dim_ff=args.dim_ff)
     else:
@@ -235,14 +236,17 @@ if __name__ == "__main__":
     p.add_argument("--mot17_weight", type=int, default=1)
     p.add_argument("--mot20_train_path", type=str, default=f"{DS}/MOT20/train")
     p.add_argument("--mot20_val_path", type=str, default=f"{DS}/MOT20/val")
+    # p.add_argument("--mot20_det_dir", type=str, default=None)
     p.add_argument("--mot20_det_dir", type=str, default=f"{DET}/MOT20")
     p.add_argument("--mot20_weight", type=int, default=1)  # already sample-dominant (dense crowds)
     p.add_argument("--dancetrack_train_path", type=str, default=f"{DS}/DanceTrack/train")
     p.add_argument("--dancetrack_val_path", type=str, default=f"{DS}/DanceTrack/val")
+    # p.add_argument("--dancetrack_det_dir", type=str, default=None)
     p.add_argument("--dancetrack_det_dir", type=str, default=f"{DET}/DanceTrack")
     p.add_argument("--dancetrack_weight", type=int, default=1)
     p.add_argument("--sportsmot_train_path", type=str, default=f"{DS}/SportsMOT/train")
     p.add_argument("--sportsmot_val_path", type=str, default=f"{DS}/SportsMOT/val")
+    # p.add_argument("--sportsmot_det_dir", type=str, default=None)
     p.add_argument("--sportsmot_det_dir", type=str, default=f"{DET}/SportsMOT")
     p.add_argument("--sportsmot_weight", type=int, default=1)
     p.add_argument("--seq_in_len", type=int, default=30)
@@ -253,9 +257,9 @@ if __name__ == "__main__":
     # very different sample counts across datasets (e.g. stride up the large ones).
     p.add_argument("--mot17_step", type=int, default=1)
     # p.add_argument("--mot17_step", type=int, default=1)
-    p.add_argument("--mot20_step", type=int, default=15)
-    p.add_argument("--dancetrack_step", type=int, default=4)
-    p.add_argument("--sportsmot_step", type=int, default=4)
+    p.add_argument("--mot20_step", type=int, default=20)
+    p.add_argument("--dancetrack_step", type=int, default=6)
+    p.add_argument("--sportsmot_step", type=int, default=6)
     p.add_argument("--match_iou", type=float, default=0.5)
     p.add_argument("--min_observed_frac", type=float, default=0.0,
                    help="Skip windows whose input context has < this fraction of REAL matched detections (0 = keep all)")
@@ -263,19 +267,21 @@ if __name__ == "__main__":
     p.add_argument("--val_random_drop_prob", type=float, default=0.3)
     p.add_argument("--max_gap_norm", type=float, default=30.0)
     p.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "lstm"])
-    p.add_argument("--d_model", type=int, default=256)
+    p.add_argument("--d_model", type=int, default=32)
     p.add_argument("--nhead", type=int, default=8)
-    p.add_argument("--num_layers", type=int, default=8)
-    p.add_argument("--dim_ff", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.15)
+    p.add_argument("--num_layers", type=int, default=3)
+    p.add_argument("--dim_ff", type=int, default=64)
+    p.add_argument("--dropout", type=float, default=0.3)
+    p.add_argument("--kalman_head_layers", type=int, default=2,
+                   help="number of Linear projections in each Q/R Kalman-noise head (>= 1)")
     p.add_argument("--lstm_hidden_dim", type=int, default=128)
     p.add_argument("--lstm_num_layers", type=int, default=1)
     p.add_argument("--teacher_forcing_ratio", type=float, default=1)
     p.add_argument("--innovation_coeff", type=float, default=1.0)
     p.add_argument("--r_supervise_coeff", type=float, default=2.0)
-    p.add_argument("--q_gap_coeff", type=float, default=0.01)
-    p.add_argument("--q_easy_coeff", type=float, default=0.01)
-    p.add_argument("--q_gap_trend_coeff", type=float, default=1)
+    p.add_argument("--q_gap_coeff", type=float, default=0.5)
+    p.add_argument("--q_easy_coeff", type=float, default=0.5)
+    p.add_argument("--q_gap_trend_coeff", type=float, default=1.0)
     p.add_argument("--kf_track_coeff", type=float, default=0,
                    help="weight of the differentiable-Kalman-gain loss (joint Q/R vs GT); "
                         "0 = off. Keep innovation_coeff/r_supervise_coeff > 0 as anchors.")
@@ -283,7 +289,7 @@ if __name__ == "__main__":
                    help="upweight gap frames in the KF-track loss (where coasting/Q matters)")
     p.add_argument("--innov_obs_weight", type=float, default=0.25)
     p.add_argument("--conf_alpha", type=float, default=2.0)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=3e-4)
@@ -292,7 +298,7 @@ if __name__ == "__main__":
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gather_workers", type=int, default=0,
                    help="processes for dataset gathering (0=auto min(cpu,8), 1=serial)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_med_data_light_lstm_kfoff")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_low_data_lightvv_transformer_newarch_kftrackoff")
     p.add_argument("--resume", type=str, default=None,
                    help="path to a checkpoint (e.g. .../best_model.pth) to continue training from. "
                         "Loads model weights (adopting its architecture args); also restores "

@@ -263,6 +263,7 @@ def build_model(args, device: torch.device) -> nn.Module:
         dropout=0.0,  # deterministic grads for diagnosis
         conf_alpha=args.conf_alpha,
         max_gap_norm=args.max_gap_norm,
+        kalman_head_layers=args.kalman_head_layers,
     )
     if args.model_type == "transformer":
         model_kw.update(
@@ -593,6 +594,7 @@ def parse_args():
     p.add_argument("--dim_ff", type=int, default=512)
     p.add_argument("--lstm_hidden_dim", type=int, default=256)
     p.add_argument("--lstm_num_layers", type=int, default=1)
+    p.add_argument("--kalman_head_layers", type=int, default=3)
     p.add_argument("--conf_alpha", type=float, default=2.0)
 
     p.add_argument("--innovation_coeff", type=float, default=1.0)

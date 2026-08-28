@@ -63,6 +63,27 @@ class AdaptiveKalmanContractTest(unittest.TestCase):
             gaps[:3], torch.tensor([1.0, 2.0, 3.0]) / 30.0
         )
 
+    def test_kalman_head_depth_and_terminal_initialisation(self):
+        models = (
+            AdaptiveKalmanTransformer(
+                d_model=16, nhead=4, num_layers=1, dim_ff=32,
+                dropout=0.0, kalman_head_layers=4,
+            ),
+            AdaptiveKalmanLSTM(
+                d_model=16, hidden_dim=16, num_layers=1,
+                dropout=0.0, kalman_head_layers=1,
+            ),
+        )
+        for model, expected_depth in zip(models, (4, 1)):
+            with self.subTest(model=type(model).__name__):
+                q_linears = [layer for layer in model.head.q_head if isinstance(layer, torch.nn.Linear)]
+                r_linears = [layer for layer in model.head.r_residual_head if isinstance(layer, torch.nn.Linear)]
+                self.assertEqual(len(q_linears), expected_depth)
+                self.assertEqual(len(r_linears), expected_depth)
+                torch.testing.assert_close(q_linears[-1].bias, torch.full((4,), -12.0))
+                torch.testing.assert_close(r_linears[-1].weight, torch.zeros_like(r_linears[-1].weight))
+                torch.testing.assert_close(r_linears[-1].bias, torch.zeros_like(r_linears[-1].bias))
+
 
 if __name__ == '__main__':
     unittest.main()
