@@ -257,9 +257,9 @@ if __name__ == "__main__":
     # very different sample counts across datasets (e.g. stride up the large ones).
     p.add_argument("--mot17_step", type=int, default=1)
     # p.add_argument("--mot17_step", type=int, default=1)
-    p.add_argument("--mot20_step", type=int, default=20)
-    p.add_argument("--dancetrack_step", type=int, default=6)
-    p.add_argument("--sportsmot_step", type=int, default=6)
+    p.add_argument("--mot20_step", type=int, default=10)
+    p.add_argument("--dancetrack_step", type=int, default=3)
+    p.add_argument("--sportsmot_step", type=int, default=3)
     p.add_argument("--match_iou", type=float, default=0.5)
     p.add_argument("--min_observed_frac", type=float, default=0.0,
                    help="Skip windows whose input context has < this fraction of REAL matched detections (0 = keep all)")
@@ -291,14 +291,14 @@ if __name__ == "__main__":
     p.add_argument("--conf_alpha", type=float, default=2.0)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=60)
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=3e-4)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gather_workers", type=int, default=0,
                    help="processes for dataset gathering (0=auto min(cpu,8), 1=serial)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_low_data_lightvv_transformer_newarch_kftrackoff")
+    p.add_argument("--save_dir", type=str, default="./checkpoints/kf_adaptive_kalman_real_med_data_lightvv_1l_transformer_newarch_kftrackoff")
     p.add_argument("--resume", type=str, default=None,
                    help="path to a checkpoint (e.g. .../best_model.pth) to continue training from. "
                         "Loads model weights (adopting its architecture args); also restores "
