@@ -24,6 +24,11 @@ FEATURE_DIM = 15
 SCORE_IDX = 12
 FRAMES_SINCE_IDX = 13
 OBSERVED_IDX = 14
+# Optional detection-context columns appended after the base layout (18-D):
+# [max IoU with another detection, overlapping-detection count / 10, touches border].
+DETECTION_CONTEXT_DIM = 3
+CONTEXT_FEATURE_DIM = FEATURE_DIM + DETECTION_CONTEXT_DIM
+BORDER_MARGIN_FRACTION = 0.01
 
 
 def _has_jump(seq):
@@ -99,10 +104,49 @@ def _attach_gap_features(seq_enhanced: np.ndarray, max_gap_norm: float = 30.0) -
         seq_enhanced[i, OBSERVED_IDX] = 1.0 if observed else 0.0
 
 
-def build_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm: float = 30.0):
+def _tlbr_iou_matrix(boxes: np.ndarray) -> np.ndarray:
+    lt = np.maximum(boxes[:, None, :2], boxes[None, :, :2])
+    rb = np.minimum(boxes[:, None, 2:], boxes[None, :, 2:])
+    wh = np.maximum(rb - lt, 0.0)
+    inter = wh[..., 0] * wh[..., 1]
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / (area[:, None] + area[None, :] - inter)
+
+
+def compute_detection_context(detections_tlbr, image_width, image_height) -> np.ndarray:
+    """Per-detection context (N, 3) from ALL detections of one frame (pixel tlbr).
+
+    Identical copy of Observation-Centric-.../utils.py::compute_detection_context:
+      0. maximum IoU with any other detection (partial-occlusion cue)
+      1. number of other detections it overlaps, / 10, capped at 1
+      2. 1.0 when the box lies within 1% of the image size of a border
+    """
+    boxes = np.asarray(detections_tlbr, dtype=float).reshape(-1, 4)
+    n = len(boxes)
+    context = np.zeros((n, DETECTION_CONTEXT_DIM), dtype=float)
+    if n == 0:
+        return context
+    if n > 1:
+        overlap = np.nan_to_num(_tlbr_iou_matrix(boxes), nan=0.0)
+        np.fill_diagonal(overlap, 0.0)
+        context[:, 0] = overlap.max(axis=1)
+        context[:, 1] = np.minimum((overlap > 0).sum(axis=1) / 10.0, 1.0)
+    mx = BORDER_MARGIN_FRACTION * float(image_width)
+    my = BORDER_MARGIN_FRACTION * float(image_height)
+    context[:, 2] = (
+        (boxes[:, 0] <= mx) | (boxes[:, 1] <= my)
+        | (boxes[:, 2] >= float(image_width) - mx) | (boxes[:, 3] >= float(image_height) - my)
+    ).astype(float)
+    return context
+
+
+def build_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm: float = 30.0,
+                                   context=None):
     """
     Canonical GAP-SAFE 15-D feature builder for the adaptive Kalman Q/R model.
     Layout: [x, y, w, h, vx..vh, ax..ah, det_score, frames_since_obs, is_observed].
+    With ``context`` (n, 3) the layout is 18-D: detection-context columns are
+    appended and kept on observed rows only.
 
     This is the single source of truth for the feature representation. An identical
     copy lives in the tracker at
@@ -121,25 +165,31 @@ def build_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm: float
     scores = np.asarray(scores, dtype=float).reshape(-1)
     observed = np.asarray(observed, dtype=bool).reshape(-1)
     n = len(bboxes)
-    feat = np.zeros((n, FEATURE_DIM), dtype=np.float32)
-    for i in range(n):
-        if not observed[i]:
-            continue
-        feat[i, :4] = bboxes[i]
-        feat[i, SCORE_IDX] = scores[i]
-        if i >= 1 and observed[i - 1]:
-            feat[i, 4:8] = bboxes[i] - bboxes[i - 1]
-            if i >= 2 and observed[i - 2]:
-                feat[i, 8:12] = (bboxes[i] - bboxes[i - 1]) - (bboxes[i - 1] - bboxes[i - 2])
+    dim = FEATURE_DIM if context is None else CONTEXT_FEATURE_DIM
+    feat = np.zeros((n, dim), dtype=np.float32)
+    if n == 0:
+        return feat
+    feat[observed, :4] = bboxes[observed]
+    feat[observed, SCORE_IDX] = scores[observed]
+    if n >= 2:
+        velocity = bboxes[1:] - bboxes[:-1]
+        has_velocity = observed[1:] & observed[:-1]
+        feat[1:, 4:8][has_velocity] = velocity[has_velocity]
+        if n >= 3:
+            acceleration = velocity[1:] - velocity[:-1]
+            has_acceleration = has_velocity[1:] & has_velocity[:-1]
+            feat[2:, 8:12][has_acceleration] = acceleration[has_acceleration]
 
-    gap = 0.0
-    for i in range(n):
-        if observed[i]:
-            gap = 0.0
-        else:
-            gap += 1.0
-        feat[i, FRAMES_SINCE_IDX] = min(gap / max_gap_norm, 1.0)
-        feat[i, OBSERVED_IDX] = 1.0 if observed[i] else 0.0
+    # Frames since the last observed row; rows before any observation count from
+    # the start of the window, exactly like the original running counter.
+    index = np.arange(n)
+    last_observed = np.maximum.accumulate(np.where(observed, index, -1))
+    gap = (index - last_observed).astype(float)
+    feat[:, FRAMES_SINCE_IDX] = np.minimum(gap / max_gap_norm, 1.0)
+    feat[:, OBSERVED_IDX] = observed
+    if context is not None:
+        context = np.asarray(context, dtype=float).reshape(n, DETECTION_CONTEXT_DIM)
+        feat[observed, FEATURE_DIM:] = context[observed]
     return feat
 
 

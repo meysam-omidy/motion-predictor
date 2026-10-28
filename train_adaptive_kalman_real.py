@@ -7,6 +7,14 @@ target (trg - gt_trg)^2 is now the true detector error (matched_detection - GT).
 
 Example:
   python train_adaptive_kalman_real.py --epochs 60 --save_dir ./checkpoints/adaptive_kalman_real
+
+Paper-update options (defaults reproduce the thesis model):
+  --objective innovation   train only through the Kalman filter's innovation
+                           likelihood (no ground-truth terms, upgrade U1)
+  --objective hybrid       thesis proxy terms + the innovation likelihood
+  --q_dim 7                also learn velocity process noise (upgrade U2)
+  --use_detection_context  18-D features with detection overlap/border cues
+  --tracklet_train/--tracklet_val  label-free windows from tracker outputs
 """
 from __future__ import annotations
 import argparse, json, math, os, random, time
@@ -18,8 +26,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-from adaptive_kalman_dataset import FEATURE_DIM
+from adaptive_kalman_dataset import CONTEXT_FEATURE_DIM, FEATURE_DIM
 from adaptive_kalman_dataset_real import AdaptiveKalmanRealDataset
+from adaptive_kalman_dataset_tracklets import AdaptiveKalmanTrackletDataset
 from adaptive_kalman_motion import AdaptiveKalmanLoss, build_adaptive_kalman_model
 
 
@@ -34,7 +43,42 @@ LOSS_COMPONENTS = (
     ("loss_q_gap_trend", "q_trend"),
     ("loss_q_easy", "q_easy"),
     ("loss_kf_track", "kf_track"),
+    ("loss_innov_kf", "innov_kf"),
 )
+
+
+GT_LOSS_TERMS = ("innovation_coeff", "r_supervise_coeff", "q_gap_coeff",
+                 "q_gap_trend_coeff", "kf_track_coeff")
+
+
+def apply_objective(args):
+    """Expand --objective into loss coefficients (explicit values are kept for 'proxy')."""
+    if args.objective == "innovation":
+        for name in GT_LOSS_TERMS:
+            setattr(args, name, 0.0)
+        if args.innovation_kf_coeff <= 0:
+            args.innovation_kf_coeff = 1.0
+    elif args.objective == "hybrid" and args.innovation_kf_coeff <= 0:
+        args.innovation_kf_coeff = 1.0
+    if args.tracklet_train and any(getattr(args, name) > 0 for name in GT_LOSS_TERMS):
+        raise ValueError(
+            "tracklet datasets have no ground truth; use --objective innovation "
+            f"(or set {', '.join(GT_LOSS_TERMS)} to 0)"
+        )
+
+
+def parse_tracklet_specs(specs):
+    """'sequences_root|tracker_outputs_dir|detections_dir' -> run triples."""
+    runs = []
+    for spec in specs or []:
+        parts = spec.split("|")
+        if len(parts) != 3:
+            raise ValueError(f"tracklet spec must be 'seqs|outputs|detections': {spec}")
+        found = AdaptiveKalmanTrackletDataset.discover_runs(*parts)
+        if not found:
+            raise ValueError(f"no sequence has both an output and a detection file: {spec}")
+        runs.extend(found)
+    return runs
 
 
 def format_loss_components(metrics):
@@ -46,8 +90,11 @@ def format_loss_components(metrics):
 
 def main(args):
     set_seed(args.seed)
+    apply_objective(args)
+    feature_dim = CONTEXT_FEATURE_DIM if args.use_detection_context else FEATURE_DIM
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | Feature dim: {FEATURE_DIM}")
+    print(f"Device: {device} | Feature dim: {feature_dim} | Q dim: {args.q_dim} | "
+          f"objective: {args.objective}")
 
     common = dict(seq_in_len=args.seq_in_len, seq_out_len=args.seq_out_len,
                   seq_total_len=args.seq_total_len, steps=args.steps,
@@ -82,14 +129,28 @@ def main(args):
           f"| steps {steps_map or f'all={args.steps}'}")
 
     t_gather = time.time()
-    train_ds = AdaptiveKalmanRealDataset.from_roots(
-        train_roots, train_dets, random_drop_prob=args.random_drop_prob,
-        dataset_weights=weights or None, dataset_steps=steps_map or None,
-        num_workers=args.gather_workers, **common)
-    val_ds = AdaptiveKalmanRealDataset.from_roots(
-        val_roots, val_dets, random_drop_prob=args.val_random_drop_prob,
-        dataset_weights=None, dataset_steps=steps_map or None,
-        num_workers=args.gather_workers, **common)
+    if args.tracklet_train:
+        tracklet_kw = dict(seq_in_len=args.seq_in_len, seq_out_len=args.seq_out_len,
+                           steps=args.steps, max_gap_norm=args.max_gap_norm,
+                           min_observed_frac=max(args.min_observed_frac, 0.5),
+                           use_detection_context=args.use_detection_context)
+        train_ds = AdaptiveKalmanTrackletDataset.from_runs(
+            parse_tracklet_specs(args.tracklet_train),
+            random_drop_prob=args.random_drop_prob, **tracklet_kw)
+        val_ds = AdaptiveKalmanTrackletDataset.from_runs(
+            parse_tracklet_specs(args.tracklet_val or args.tracklet_train),
+            random_drop_prob=args.val_random_drop_prob, **tracklet_kw)
+    else:
+        train_ds = AdaptiveKalmanRealDataset.from_roots(
+            train_roots, train_dets, random_drop_prob=args.random_drop_prob,
+            dataset_weights=weights or None, dataset_steps=steps_map or None,
+            num_workers=args.gather_workers,
+            use_detection_context=args.use_detection_context, **common)
+        val_ds = AdaptiveKalmanRealDataset.from_roots(
+            val_roots, val_dets, random_drop_prob=args.val_random_drop_prob,
+            dataset_weights=None, dataset_steps=steps_map or None,
+            num_workers=args.gather_workers,
+            use_detection_context=args.use_detection_context, **common)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}  "
           f"(gathered in {time.time()-t_gather:.1f}s)")
     if len(train_ds) == 0 or len(val_ds) == 0:
@@ -112,6 +173,12 @@ def main(args):
                 "architecture requires retraining."
             )
         ck_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+        ck_feature_dim = ckpt.get("feature_dim", FEATURE_DIM) if isinstance(ckpt, dict) else FEATURE_DIM
+        if ck_feature_dim != feature_dim:
+            raise ValueError(
+                f"Resume mismatch: checkpoint feature_dim {ck_feature_dim} vs {feature_dim} "
+                "(--use_detection_context must match the checkpoint)"
+            )
         for k in ("seq_in_len", "max_gap_norm"):
             if k in ck_args and getattr(args, k) != ck_args[k]:
                 raise ValueError(
@@ -120,14 +187,14 @@ def main(args):
                     "training/inference contract."
                 )
         for k in ("model_type", "d_model", "nhead", "num_layers", "dim_ff",
-                  "lstm_hidden_dim", "lstm_num_layers", "kalman_head_layers"):
+                  "lstm_hidden_dim", "lstm_num_layers", "kalman_head_layers", "q_dim"):
             if k in ck_args and getattr(args, k, None) != ck_args[k]:
                 print(f"  [resume] override {k}: {getattr(args, k, None)} -> {ck_args[k]} (from checkpoint)")
                 setattr(args, k, ck_args[k])
 
-    model_kw = dict(input_dim=FEATURE_DIM, d_model=args.d_model, dropout=args.dropout,
+    model_kw = dict(input_dim=feature_dim, d_model=args.d_model, dropout=args.dropout,
                     conf_alpha=args.conf_alpha, max_gap_norm=args.max_gap_norm,
-                    kalman_head_layers=args.kalman_head_layers)
+                    kalman_head_layers=args.kalman_head_layers, q_dim=args.q_dim)
     if args.model_type == "transformer":
         model_kw.update(nhead=args.nhead, num_layers=args.num_layers, dim_ff=args.dim_ff)
     else:
@@ -146,7 +213,16 @@ def main(args):
         q_gap_coeff=args.q_gap_coeff, q_easy_coeff=args.q_easy_coeff,
         q_gap_trend_coeff=args.q_gap_trend_coeff, innov_obs_weight=args.innov_obs_weight,
         conf_alpha=args.conf_alpha,
-        kf_track_coeff=args.kf_track_coeff, kf_gap_weight=args.kf_gap_weight)
+        kf_track_coeff=args.kf_track_coeff, kf_gap_weight=args.kf_gap_weight,
+        kf_vel_floor=args.kf_vel_floor,
+        innovation_kf_coeff=args.innovation_kf_coeff,
+        innovation_kf_vel_floor=args.innovation_kf_vel_floor,
+        innovation_kf_burn_in=args.innovation_kf_burn_in,
+        innovation_kf_fp32=args.innovation_kf_fp32)
+    print(f"Loss: proxy(innov {args.innovation_coeff}, r {args.r_supervise_coeff}, "
+          f"q_gap {args.q_gap_coeff}, q_trend {args.q_gap_trend_coeff}, "
+          f"q_easy {args.q_easy_coeff}, kf_track {args.kf_track_coeff}) + "
+          f"innovation_kf {args.innovation_kf_coeff}")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
                                   patience=max(1, args.patience // 3))
@@ -214,7 +290,8 @@ def main(args):
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "val_loss": val_loss, "val_metrics": vm, "args": vars(args),
-                        "feature_dim": FEATURE_DIM, "model_type": args.model_type,
+                        "feature_dim": feature_dim, "model_type": args.model_type,
+                        "q_dim": args.q_dim, "objective": args.objective,
                         "adaptive_qr_version": 2, "history_len": args.seq_in_len},
                        save_dir / "best_model.pth")
             print(f"  -> best saved (val {val_loss:.4f})")
@@ -287,6 +364,32 @@ if __name__ == "__main__":
                         "0 = off. Keep innovation_coeff/r_supervise_coeff > 0 as anchors.")
     p.add_argument("--kf_gap_weight", type=float, default=3.0,
                    help="upweight gap frames in the KF-track loss (where coasting/Q matters)")
+    p.add_argument("--kf_vel_floor", type=float, default=0.01,
+                   help="velocity process noise of the kf_track loss when Q is 4-D "
+                        "(normalized units; 0.01 is the thesis value)")
+    # ---- paper-update options (defaults reproduce the thesis model) ----
+    p.add_argument("--objective", choices=["proxy", "innovation", "hybrid"], default="proxy",
+                   help="proxy = thesis 5-term loss; innovation = only the label-free innovation "
+                        "likelihood through the Kalman filter (U1); hybrid = both")
+    p.add_argument("--innovation_kf_coeff", type=float, default=0.0,
+                   help="weight of the innovation-likelihood loss (set to 1 by --objective innovation/hybrid)")
+    p.add_argument("--innovation_kf_fp32", action="store_true", default=True,
+                   help="run the innovation-likelihood Kalman filter in float32 (default; fast on GPU)")
+    p.add_argument("--no_innovation_kf_fp32", action="store_false", dest="innovation_kf_fp32",
+                   help="run it in float64 instead (slower, more exact)")
+    p.add_argument("--innovation_kf_burn_in", type=int, default=1,
+                   help="observed target steps skipped before scoring the innovation likelihood")
+    p.add_argument("--innovation_kf_vel_floor", type=float, default=1e-8,
+                   help="velocity process noise in the innovation loss when Q is 4-D (normalized units)")
+    p.add_argument("--q_dim", type=int, choices=[4, 7], default=4,
+                   help="4 = xywh process noise (thesis); 7 = also learn velocity noise (U2)")
+    p.add_argument("--use_detection_context", action="store_true",
+                   help="append detection overlap/crowding/border features (18-D input)")
+    p.add_argument("--tracklet_train", nargs="*", default=None,
+                   help="label-free training data: 'sequences_root|tracker_outputs_dir|detections_dir' "
+                        "(replaces the GT datasets; needs --objective innovation)")
+    p.add_argument("--tracklet_val", nargs="*", default=None,
+                   help="label-free validation data in the same format (default: --tracklet_train)")
     p.add_argument("--innov_obs_weight", type=float, default=0.25)
     p.add_argument("--conf_alpha", type=float, default=2.0)
     p.add_argument("--batch_size", type=int, default=256)

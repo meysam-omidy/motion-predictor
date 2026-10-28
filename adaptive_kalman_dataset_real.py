@@ -25,7 +25,9 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from adaptive_kalman_dataset import _has_jump, build_adaptive_kalman_features
+from adaptive_kalman_dataset import (
+    DETECTION_CONTEXT_DIM, _has_jump, build_adaptive_kalman_features, compute_detection_context,
+)
 
 
 def _tlbr_from_center(b):  # b: (...,4) center xywh -> tlbr
@@ -84,6 +86,7 @@ class AdaptiveKalmanRealDataset(Dataset):
         random_drop_prob: Optional[float],
         max_gap_norm: float,
         min_observed_frac: float = 0.0,
+        use_detection_context: bool = False,
     ) -> Tuple[list, list, list, list]:
         # print(seq_path)
         # print(det_path)
@@ -105,9 +108,13 @@ class AdaptiveKalmanRealDataset(Dataset):
         if det.ndim == 1:
             det = det[None, :]
         det_by_frame = {}
+        context_by_frame = {}
         for fr in np.unique(det[:, 0]):
             rows = det[det[:, 0] == fr]
             det_by_frame[int(fr)] = (rows[:, 1:5].astype(float), rows[:, 5].astype(float))
+            if use_detection_context:
+                # Same per-frame context the tracker computes from all raw detections.
+                context_by_frame[int(fr)] = compute_detection_context(rows[:, 1:5], iw, ih)
 
         df = pd.read_csv(gt_path, header=None)
         df.columns = ["frame", "id", "x", "y", "w", "h", "conf", "class", "visibility"]
@@ -134,6 +141,7 @@ class AdaptiveKalmanRealDataset(Dataset):
             obs_box = np.zeros((n, 4), dtype=float)
             obs_score = np.zeros((n,), dtype=float)
             obs_flag = np.zeros((n,), dtype=bool)
+            obs_context = np.zeros((n, DETECTION_CONTEXT_DIM), dtype=float)
             # print(gt_box.shape)
             for k in range(n):
                 fr = int(frames_total[k])
@@ -155,6 +163,8 @@ class AdaptiveKalmanRealDataset(Dataset):
                 obs_box[k] = [db[0] + dw / 2, db[1] + dh / 2, dw, dh]
                 obs_score[k] = float(dscores[j])
                 obs_flag[k] = True
+                if use_detection_context:
+                    obs_context[k] = context_by_frame[fr][j]
 
             # normalize
             gt_norm = gt_box / borders
@@ -187,12 +197,16 @@ class AdaptiveKalmanRealDataset(Dataset):
 
                 # gap-safe features: derivatives crossing a gap are zeroed, so this
                 # matches the tracker's inference builder exactly. GT is fully observed.
-                enh = build_adaptive_kalman_features(seq_obs, seq_score, obs_mask, max_gap_norm)
+                seq_context = obs_context[sl] if use_detection_context else None
+                enh = build_adaptive_kalman_features(
+                    seq_obs, seq_score, obs_mask, max_gap_norm, context=seq_context
+                )
                 enh_gt = build_adaptive_kalman_features(
                     seq_gt,
                     np.ones(seq_total_len, dtype=float),
                     np.ones(seq_total_len, dtype=bool),
                     max_gap_norm,
+                    context=None if seq_context is None else np.zeros_like(seq_context),
                 )
 
                 sources.append(enh[:seq_in_len])
@@ -218,6 +232,7 @@ class AdaptiveKalmanRealDataset(Dataset):
         dataset_weights: Optional[dict] = None,
         dataset_steps: Optional[dict] = None,
         num_workers: int = 0,
+        use_detection_context: bool = False,
     ) -> "AdaptiveKalmanRealDataset":
         # One task per sequence, resolving per-dataset stride (`dataset_steps`) and
         # oversample factor (`dataset_weights`). `steps` is the fallback stride.
@@ -232,6 +247,7 @@ class AdaptiveKalmanRealDataset(Dataset):
                     seq_total_len=seq_total_len, steps=step_r,
                     match_iou=match_iou, random_drop_prob=random_drop_prob,
                     max_gap_norm=max_gap_norm, min_observed_frac=min_observed_frac,
+                    use_detection_context=use_detection_context,
                 )
                 tasks.append((
                     os.path.join(root, seq),

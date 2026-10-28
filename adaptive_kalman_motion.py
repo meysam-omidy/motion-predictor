@@ -268,6 +268,7 @@ def differentiable_kf_track_loss(
     dtype = log_var_q.dtype
     Fm, Hm = _kf_matrices(gt_xywh.device, dtype)
     var_q = exp_var(log_var_q, var_floor)
+    learned_velocity = var_q.size(-1) == 7
     var_r = exp_var(log_var_r, var_floor)
     gt_z = _xywh_to_z(gt_xywh)
     gt_src_z = _xywh_to_z(gt_src_xywh)
@@ -283,8 +284,8 @@ def differentiable_kf_track_loss(
     losses, weights = [], []
     for t in range(T):
         w_t, h_t = gt_xywh[:, t, 2], gt_xywh[:, t, 3]
-        q7 = torch.cat([_var_xywh_to_zdiag(var_q[:, t], w_t, h_t),
-                        x.new_full((B, 3), vel_floor)], dim=-1)
+        q_vel = var_q[:, t, 4:7] if learned_velocity else x.new_full((B, 3), vel_floor)
+        q7 = torch.cat([_var_xywh_to_zdiag(var_q[:, t, :4], w_t, h_t), q_vel], dim=-1)
         Q = torch.diag_embed(q7)
         R = torch.diag_embed(_var_xywh_to_zdiag(var_r[:, t], w_t, h_t))
 
@@ -308,7 +309,132 @@ def differentiable_kf_track_loss(
     denom = torch.stack(weights).sum().clamp(min=1.0)
     return total / denom, total.detach() / denom
 
-    
+
+def _init_state_from_history(src, vel_floor, dtype):
+    """KF state and covariance at the last observed history row (detections only).
+
+    Position = last observed box. Velocity = that row's velocity feature when the
+    previous row was observed too, else zero with a large velocity variance.
+    Returns x (B,7,1), P (B,7,7), steps_since (B,) frames between that row and the
+    end of the history, and valid (B,) = the history has at least one observation.
+    """
+    B, S, _ = src.shape
+    observed = src[..., 14] > 0.5
+    index = torch.arange(S, device=src.device).expand(B, S)
+    last = torch.where(observed, index, torch.full_like(index, -1)).max(dim=1).values
+    valid = last >= 0
+    rows = src[torch.arange(B, device=src.device), last.clamp(min=0)].to(dtype)
+    box = rows[:, :4]
+    vel_xywh = rows[:, 4:8]
+    has_velocity = vel_xywh.abs().sum(-1) > 0
+    z = _xywh_to_z(box)
+    prev_z = _xywh_to_z(box - vel_xywh)
+    vel_z = torch.where(has_velocity.unsqueeze(-1), z - prev_z, torch.zeros_like(z))
+    x = torch.cat([z, vel_z[:, :3]], dim=-1).unsqueeze(-1)
+    pos_var = z.new_tensor([1e-4, 1e-4, 1e-6, 1e-2]).expand(B, 4)
+    vel_var = torch.where(
+        has_velocity.unsqueeze(-1),
+        z.new_tensor([1e-4, 1e-4, 1e-6]).expand(B, 3),
+        z.new_tensor([1e-2, 1e-2, 1e-4]).expand(B, 3),
+    )
+    P = torch.diag_embed(torch.cat([pos_var, vel_var], dim=-1))
+    steps_since = (S - 1 - last).clamp(min=0)
+    return x, P, steps_since, valid
+
+
+def innovation_likelihood_kf_loss(
+    log_var_q, log_var_r, src, trg,
+    var_floor=VAR_FLOOR, vel_floor=1e-8, compute_dtype=torch.float32,
+    burn_in=1,
+):
+    """Self-supervised Q/R loss: negative log-likelihood of each new DETECTION
+    under the Kalman filter's own prediction (paper upgrade U1).
+
+    The same SORT filter as the tracker (7-D x,y,s,r,vx,vy,vs state, normalized
+    image units) is initialized from the history window and run over the target
+    window with the network's Q (before each step) and R (for each observed step).
+    For every observed target step t the innovation nu = z - Hx and its covariance
+    S = H P H^T + R give
+
+        L_t = 0.5 * (nu^T S^-1 nu + log|S| + 4 log 2pi).
+
+    Only detector boxes, scores and gap flags are used: no ground truth. Q and R
+    are therefore trained jointly in their real role in the filter, and the loss
+    can be computed on unlabeled tracklets. ``burn_in`` skips the first observed
+    target steps, whose covariance is dominated by the coarse initialization.
+    With a 4-D Q the velocity process noise is the constant ``vel_floor``
+    (the tracker's tiny pixel floor is ~1e-8 in normalized units); a 7-D Q learns it.
+    Returns (loss, detached loss, number of scored steps).
+    """
+    B, T, _ = trg.shape
+    if T < 1:
+        zero = trg.new_tensor(0.0)
+        return zero, zero, 0
+    dtype = compute_dtype
+    jitter = 1e-12 if dtype == torch.float64 else 1e-10
+    Fm, Hm = _kf_matrices(trg.device, dtype)
+    var_q = exp_var(log_var_q, var_floor).to(dtype)
+    var_r = exp_var(log_var_r, var_floor).to(dtype)
+    learned_velocity = var_q.size(-1) == 7
+    x, P, steps_since, valid = _init_state_from_history(src, vel_floor, dtype)
+    I4 = torch.eye(4, device=trg.device, dtype=dtype)
+    I7 = torch.eye(7, device=trg.device, dtype=dtype)
+    log_2pi = math.log(2 * math.pi)
+
+    def process_noise(t, state):
+        wh = _z_to_xywh(state[:, :4, 0])
+        q_vel = var_q[:, t, 4:7] if learned_velocity else state.new_full((B, 3), vel_floor)
+        return torch.diag_embed(
+            torch.cat([_var_xywh_to_zdiag(var_q[:, t, :4], wh[:, 2], wh[:, 3]), q_vel], dim=-1)
+        )
+
+    # Advance from the last observed history row to the end of the history window
+    # (rows that were gaps), using the first target step's Q as the best estimate.
+    max_steps = int(steps_since.max().item()) if B else 0
+    for k in range(max_steps):
+        advance = (steps_since > k).view(B, 1, 1)
+        Q0 = process_noise(0, x)
+        x = torch.where(advance, Fm @ x, x)
+        P = torch.where(advance, Fm @ P @ Fm.transpose(-1, -2) + Q0, P)
+
+    observed = trg[..., 14] > 0.5
+    seen = torch.zeros(B, dtype=torch.long, device=trg.device)
+    terms, counts = [], []
+    for t in range(T):
+        Q = process_noise(t, x)
+        x = Fm @ x
+        P = Fm @ P @ Fm.transpose(-1, -2) + Q
+        obs_t = observed[:, t] & valid
+        z = _xywh_to_z(trg[:, t, :4].to(dtype)).unsqueeze(-1)
+        w_t = trg[:, t, 2].to(dtype).clamp(min=1e-6)
+        h_t = trg[:, t, 3].to(dtype).clamp(min=1e-6)
+        R = torch.diag_embed(_var_xywh_to_zdiag(var_r[:, t], w_t, h_t))
+        nu = z - Hm @ x
+        # Jitter keeps the Cholesky stable; fp32 needs a larger one than fp64.
+        S = Hm @ P @ Hm.transpose(-1, -2) + R + jitter * I4
+        S = 0.5 * (S + S.transpose(-1, -2))
+        L, info = torch.linalg.cholesky_ex(S)
+        ok = obs_t & (info == 0)
+        L = torch.where(ok.view(B, 1, 1), L, I4.expand(B, 4, 4))
+        solved = torch.cholesky_solve(nu, L)
+        mahalanobis = (nu * solved).sum(dim=(-1, -2))
+        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+        nll = 0.5 * (mahalanobis.clamp(max=1e6) + logdet + 4 * log_2pi)
+        scored = ok & (seen >= burn_in)
+        terms.append(torch.where(scored, nll, torch.zeros_like(nll)))
+        counts.append(scored.to(dtype))
+        # Kalman update on observed steps only (gaps keep the prediction).
+        K = P @ Hm.transpose(-1, -2) @ torch.cholesky_inverse(L)
+        x = torch.where(ok.view(B, 1, 1), x + K @ nu, x)
+        P = torch.where(ok.view(B, 1, 1), (I7 - K @ Hm) @ P, P)
+        seen = seen + ok.long()
+
+    count = torch.stack(counts).sum()
+    total = torch.stack(terms).sum() / count.clamp(min=1.0)
+    total = total.to(log_var_q.dtype)
+    return total, total.detach(), int(count.item())
+
+
 def nfc(n_layers, input_dim, output_dim, dropout):
     if n_layers < 1:
         raise ValueError("n_layers must be at least 1")
@@ -360,6 +486,11 @@ class AdaptiveKalmanLoss(nn.Module):
         var_floor: float = VAR_FLOOR,
         kf_track_coeff: float = 0.0,
         kf_gap_weight: float = 3.0,
+        innovation_kf_coeff: float = 0.0,
+        kf_vel_floor: float = 0.01,
+        innovation_kf_vel_floor: float = 1e-8,
+        innovation_kf_burn_in: int = 1,
+        innovation_kf_fp32: bool = True,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
@@ -374,6 +505,20 @@ class AdaptiveKalmanLoss(nn.Module):
         # Keep innovation_coeff / r_supervise_coeff > 0 as scale anchors when using this.
         self.kf_track_coeff = kf_track_coeff
         self.kf_gap_weight = kf_gap_weight
+        self.kf_vel_floor = kf_vel_floor
+        # Self-supervised innovation likelihood through the filter (0 = off).
+        self.innovation_kf_coeff = innovation_kf_coeff
+        self.innovation_kf_vel_floor = innovation_kf_vel_floor
+        self.innovation_kf_burn_in = innovation_kf_burn_in
+        # fp32 is fast on consumer GPUs; fp64 is the slower, more exact fallback.
+        self.innovation_kf_dtype = torch.float32 if innovation_kf_fp32 else torch.float64
+
+    @property
+    def uses_ground_truth(self) -> bool:
+        return any(c > 0 for c in (
+            self.innovation_coeff, self.r_supervise_coeff, self.q_gap_coeff,
+            self.q_gap_trend_coeff, self.kf_track_coeff,
+        ))
 
     def forward(
         self,
@@ -383,7 +528,12 @@ class AdaptiveKalmanLoss(nn.Module):
         trg: torch.Tensor,
         gt_trg: torch.Tensor,
         gt_src: Optional[torch.Tensor] = None,
+        src: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
+        # A 7-D Q (U2) carries velocity variances after the 4 xywh entries; the
+        # GT proxy terms below only describe the xywh part.
+        log_var_q_full = log_var_q
+        log_var_q = log_var_q[..., :4]
         # log_var_q / log_var_r are true log-variances. Use exp — never softplus —
         # so gradients stay well-conditioned (no softplus saturation).
         # Keep within the same range as the stable NLL path (avoid exp overflow).
@@ -465,13 +615,29 @@ class AdaptiveKalmanLoss(nn.Module):
         # Joint Q/R supervision through a differentiable Kalman gain (optional).
         if self.kf_track_coeff > 0 and gt_src is not None:
             loss_kf_track, kf_track_val = differentiable_kf_track_loss(
-                log_var_q, log_var_r,
+                log_var_q_full, log_var_r,
                 trg[..., :4], gt_src[..., :4], gt_trg[..., :4], observed.squeeze(-1),
-                var_floor=self.var_floor, gap_weight=self.kf_gap_weight,
+                var_floor=self.var_floor, vel_floor=self.kf_vel_floor,
+                gap_weight=self.kf_gap_weight,
             )
         else:
             loss_kf_track = innovations.new_tensor(0.0)
             kf_track_val = innovations.new_tensor(0.0)
+
+        # Self-supervised innovation likelihood through the filter (U1).
+        if self.innovation_kf_coeff > 0:
+            if src is None:
+                raise ValueError("innovation_kf_coeff > 0 needs the history window `src`")
+            loss_innov_kf, innov_kf_val, innov_kf_steps = innovation_likelihood_kf_loss(
+                log_var_q_full, log_var_r, src, trg,
+                var_floor=self.var_floor, vel_floor=self.innovation_kf_vel_floor,
+                burn_in=self.innovation_kf_burn_in,
+                compute_dtype=self.innovation_kf_dtype,
+            )
+        else:
+            loss_innov_kf = innovations.new_tensor(0.0)
+            innov_kf_val = innovations.new_tensor(0.0)
+            innov_kf_steps = 0
 
         loss = (
             self.innovation_coeff * loss_innov
@@ -480,6 +646,7 @@ class AdaptiveKalmanLoss(nn.Module):
             + self.q_gap_trend_coeff * loss_q_gap_trend
             + self.q_easy_coeff * loss_q_easy
             + self.kf_track_coeff * loss_kf_track
+            + self.innovation_kf_coeff * loss_innov_kf
         )
 
         with torch.no_grad():
@@ -495,6 +662,8 @@ class AdaptiveKalmanLoss(nn.Module):
                 "loss_q_gap_trend": float(loss_q_gap_trend),
                 "loss_q_easy": float(loss_q_easy),
                 "loss_kf_track": float(kf_track_val),
+                "loss_innov_kf": float(innov_kf_val),
+                "innov_kf_steps": float(innov_kf_steps),
                 "mean_var_q": float(var_q.mean()),
                 "mean_var_r": float(var_r.mean()),
                 "mean_innov_sq": float(innov_sq.mean()),
@@ -507,6 +676,8 @@ class AdaptiveKalmanLoss(nn.Module):
             if observed.any():
                 metrics["mean_var_r_obs"] = float(var_r[observed.expand_as(var_r)].mean())
                 metrics["mean_var_q_observed"] = float(var_q[observed.expand_as(var_q)].mean())
+            if log_var_q_full.size(-1) == 7:
+                metrics["mean_var_q_velocity"] = float(exp_var(log_var_q_full[..., 4:]).mean())
 
         return loss, metrics
 
@@ -521,9 +692,14 @@ class _AdaptiveKalmanHead(nn.Module):
         conf_alpha: float = 2.0,
         q_init_bias: float = -12.0,
         num_layers: int = 3,
+        q_dim: int = 4,
+        q_velocity_init_bias: float = -18.0,
     ):
         super().__init__()
+        if q_dim not in (4, 7):
+            raise ValueError("q_dim must be 4 (xywh) or 7 (xywh + velocity)")
         self.conf_alpha = conf_alpha
+        self.q_dim = q_dim
         # Q head output is interpreted directly as log(var_q) by the loss.
         # Bias = -12 → exp(-12) ≈ 6e-6 at init: a mid-scale start that sits
         # between low-motion (MOT17 ~6e-7) and high-motion (DanceTrack ~6e-5)
@@ -533,7 +709,7 @@ class _AdaptiveKalmanHead(nn.Module):
         self.q_head = nfc(
             n_layers=num_layers,
             input_dim=hidden_dim + 1,
-            output_dim=4,
+            output_dim=q_dim,
             dropout=dropout * 0.5
         )
         self.r_residual_head = nfc(
@@ -550,6 +726,11 @@ class _AdaptiveKalmanHead(nn.Module):
         if not isinstance(q_output, nn.Linear) or not isinstance(r_output, nn.Linear):
             raise TypeError("adaptive Kalman heads must end in nn.Linear")
         nn.init.constant_(q_output.bias, q_init_bias)
+        if q_dim == 7:
+            # Velocity variances (normalized z units) start near the tracker's
+            # tiny fixed velocity floor, so a fresh model behaves like the thesis.
+            with torch.no_grad():
+                q_output.bias[4:] = q_velocity_init_bias
         nn.init.xavier_uniform_(q_output.weight, gain=0.1)
         # Additive log-space delta on the confidence prior. Zero init → start at
         # prior; signed delta lets R go above or below the prior (unlike the old
@@ -584,6 +765,7 @@ class AdaptiveKalmanTransformer(nn.Module):
         conf_alpha: float = 2.0,
         max_gap_norm: float = 30.0,
         kalman_head_layers: int = 3,
+        q_dim: int = 4,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -612,7 +794,8 @@ class AdaptiveKalmanTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
         self.head = _AdaptiveKalmanHead(
-            d_model, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
+            d_model, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers,
+            q_dim=q_dim,
         )
 
     @staticmethod
@@ -710,7 +893,9 @@ class AdaptiveKalmanTransformer(nn.Module):
             innovations = build_cv_innovations(
                 gt_src, gt_trg, observed=trg[..., 14]
             )
-            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
+            loss, metrics = criterion(
+                log_q, log_r, innovations, trg, gt_trg, gt_src, src=src
+            )
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -747,7 +932,9 @@ class AdaptiveKalmanTransformer(nn.Module):
                 innovations = build_cv_innovations(
                     gt_src, gt_trg, observed=trg[..., 14]
                 )
-                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
+                loss, metrics = criterion(
+                log_q, log_r, innovations, trg, gt_trg, gt_src, src=src
+            )
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v
@@ -778,6 +965,7 @@ class AdaptiveKalmanLSTM(nn.Module):
         teacher_forcing_ratio: float = 0.5,
         max_gap_norm: float = 30.0,
         kalman_head_layers: int = 3,
+        q_dim: int = 4,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -803,7 +991,8 @@ class AdaptiveKalmanLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.head = _AdaptiveKalmanHead(
-            hidden_dim, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
+            hidden_dim, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers,
+            q_dim=q_dim,
         )
 
     def forward(
@@ -866,7 +1055,9 @@ class AdaptiveKalmanLSTM(nn.Module):
             innovations = build_cv_innovations(
                 gt_src, gt_trg, observed=trg[..., 14]
             )
-            loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
+            loss, metrics = criterion(
+                log_q, log_r, innovations, trg, gt_trg, gt_src, src=src
+            )
             if not _optimizer_step_finite(self, optimizer, loss):
                 n_skip += 1
                 continue
@@ -905,7 +1096,9 @@ class AdaptiveKalmanLSTM(nn.Module):
                 innovations = build_cv_innovations(
                     gt_src, gt_trg, observed=trg[..., 14]
                 )
-                loss, metrics = criterion(log_q, log_r, innovations, trg, gt_trg, gt_src)
+                loss, metrics = criterion(
+                log_q, log_r, innovations, trg, gt_trg, gt_src, src=src
+            )
                 total += loss.item()
                 for k, v in metrics.items():
                     agg[k] = agg.get(k, 0.0) + v
