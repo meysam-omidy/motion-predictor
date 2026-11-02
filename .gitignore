@@ -214,3 +214,4 @@ pretrained
 phase1
 checkpoints
 eval
+test_*
