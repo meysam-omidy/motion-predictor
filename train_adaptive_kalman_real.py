@@ -67,6 +67,25 @@ def apply_objective(args):
         )
 
 
+def resolve_dataset_paths(datasets, data_root=None, det_roots=None):
+    """Apply --data_root / --det_roots to the per-dataset defaults.
+
+    data_root:  <data_root>/<Dataset>/train and .../val replace the per-dataset paths.
+    det_roots:  one or more detector folders, each laid out as <root>/<Dataset>/<seq>.txt
+                (e.g. YOLOXx-ft and YOLOXx-r); they replace the per-dataset det dirs and
+                are all used together. Without it, each dataset keeps its single dir.
+    Returns (name, train_path, val_path, [det_dirs], weight) tuples.
+    """
+    out = []
+    for name, tr, va, det, w in datasets:
+        if data_root:
+            tr = os.path.join(data_root, name, "train")
+            va = os.path.join(data_root, name, "val")
+        dets = [os.path.join(root, name) for root in det_roots] if det_roots else [det]
+        out.append((name, tr, va, dets, w))
+    return out
+
+
 def parse_tracklet_specs(specs):
     """'sequences_root|tracker_outputs_dir|detections_dir' -> run triples."""
     runs = []
@@ -101,32 +120,38 @@ def main(args):
                   match_iou=args.match_iou, max_gap_norm=args.max_gap_norm,
                   min_observed_frac=args.min_observed_frac)
 
-    # (name, train_path, val_path, detection_dir, oversample_weight). A dataset is
-    # used only if BOTH its data root and its detection dir exist (SportsMOT has no
-    # detections, so it is skipped automatically).
+    # (name, train_path, val_path, detection_dirs, oversample_weight). A dataset is
+    # used only if BOTH its data root and at least one detection dir exist
+    # (a dataset without detections is skipped automatically).
     datasets = [
         ("MOT17", args.mot17_train_path, args.mot17_val_path, args.mot17_det_dir, args.mot17_weight),
         ("MOT20", args.mot20_train_path, args.mot20_val_path, args.mot20_det_dir, args.mot20_weight),
         ("DanceTrack", args.dancetrack_train_path, args.dancetrack_val_path, args.dancetrack_det_dir, args.dancetrack_weight),
         ("SportsMOT", args.sportsmot_train_path, args.sportsmot_val_path, args.sportsmot_det_dir, args.sportsmot_weight),
     ]
+    datasets = resolve_dataset_paths(datasets, args.data_root, args.det_roots)
     train_roots, train_dets, val_roots, val_dets, weights, steps_map = [], [], [], [], {}, {}
-    for name, tr, va, det, w in datasets:
-        det_ok = det and os.path.isdir(det) and len(os.listdir(det)) > 0
-        if not det_ok:
-            print(f"  skip {name}: no detections at {det}")
+    for name, tr, va, dets, w in datasets:
+        dets = [d for d in dets if d and os.path.isdir(d) and len(os.listdir(d)) > 0]
+        if not dets:
+            print(f"  skip {name}: no detections")
             continue
         st = getattr(args, f"{name.lower()}_step", None)  # per-dataset stride override
         if tr and os.path.isdir(tr):
-            train_roots.append(tr); train_dets.append(det)
+            # Several detection sets are aggregated: every (sequence, detector)
+            # pair contributes its own windows to the same dataset.
+            for det in dets:
+                train_roots.append(tr); train_dets.append(det)
             if w > 1:
                 weights[name] = w
             if st is not None:
                 steps_map[name] = st
         if va and os.path.isdir(va):
-            val_roots.append(va); val_dets.append(det)
-    print(f"Datasets used: {[r.split('/')[-2] for r in train_roots]} | weights {weights} "
-          f"| steps {steps_map or f'all={args.steps}'}")
+            for det in dets:
+                val_roots.append(va); val_dets.append(det)
+        print(f"  {name}: detections from {dets}")
+    print(f"Datasets used: {sorted({r.replace(os.sep, '/').split('/')[-2] for r in train_roots})} "
+          f"| weights {weights} | steps {steps_map or f'all={args.steps}'}")
 
     t_gather = time.time()
     if args.tracklet_train:
@@ -326,6 +351,12 @@ if __name__ == "__main__":
     # p.add_argument("--sportsmot_det_dir", type=str, default=None)
     p.add_argument("--sportsmot_det_dir", type=str, default=f"{DET}/SportsMOT")
     p.add_argument("--sportsmot_weight", type=int, default=1)
+    p.add_argument("--data_root", type=str, default=None,
+                   help="folder with <Dataset>/train and <Dataset>/val; overrides the per-dataset paths")
+    p.add_argument("--det_roots", nargs="*", default=None,
+                   help="one or more detector folders laid out as <root>/<Dataset>/<seq>.txt "
+                        "(e.g. .../YOLOXx-ft .../YOLOXx-r); all are aggregated and they "
+                        "override the per-dataset --*_det_dir values")
     p.add_argument("--seq_in_len", type=int, default=30)
     p.add_argument("--seq_out_len", type=int, default=20)
     p.add_argument("--seq_total_len", type=int, default=50)
