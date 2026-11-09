@@ -332,6 +332,7 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     DS = "C:/Projects/.Datasets"; DET = "C:/Projects/.Detections/YOLOXx"
+    DETS = ["C:/Projects/.Detections/YOLOXx-ft", "C:/Projects/.Detections/YOLOXx-r"]
     p.add_argument("--mot17_train_path", type=str, default=f"{DS}/MOT17/train")
     p.add_argument("--mot17_val_path", type=str, default=f"{DS}/MOT17/val")
     p.add_argument("--mot17_det_dir", type=str, default=f"{DET}/MOT17")
@@ -353,7 +354,7 @@ if __name__ == "__main__":
     p.add_argument("--sportsmot_weight", type=int, default=1)
     p.add_argument("--data_root", type=str, default=None,
                    help="folder with <Dataset>/train and <Dataset>/val; overrides the per-dataset paths")
-    p.add_argument("--det_roots", nargs="*", default=None,
+    p.add_argument("--det_roots", nargs="*", default=DETS,
                    help="one or more detector folders laid out as <root>/<Dataset>/<seq>.txt "
                         "(e.g. .../YOLOXx-ft .../YOLOXx-r); all are aggregated and they "
                         "override the per-dataset --*_det_dir values")
