@@ -243,14 +243,17 @@ def main(args):
         innovation_kf_coeff=args.innovation_kf_coeff,
         innovation_kf_vel_floor=args.innovation_kf_vel_floor,
         innovation_kf_burn_in=args.innovation_kf_burn_in,
-        innovation_kf_fp32=args.innovation_kf_fp32)
+        innovation_kf_fp32=args.innovation_kf_fp32,
+        innovation_kf_robust=args.innovation_kf_robust,
+        innovation_kf_robust_param=args.innovation_kf_robust_param,
+        innovation_kf_gate=args.innovation_kf_gate)
     print(f"Loss: proxy(innov {args.innovation_coeff}, r {args.r_supervise_coeff}, "
           f"q_gap {args.q_gap_coeff}, q_trend {args.q_gap_trend_coeff}, "
           f"q_easy {args.q_easy_coeff}, kf_track {args.kf_track_coeff}) + "
           f"innovation_kf {args.innovation_kf_coeff}")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
-                                  patience=max(1, args.patience // 3))
+    lr_patience = args.lr_patience if args.lr_patience is not None else max(1, args.patience // 3)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=lr_patience)
 
     start_epoch, best_val = 1, float("inf")
     if ckpt is not None:
@@ -285,6 +288,7 @@ def main(args):
         "train_metrics": [], "val_metrics": [],
     }
 
+    smoothed_val = None
     end_epoch = start_epoch + args.epochs - 1
     for epoch in range(start_epoch, end_epoch + 1):
         t0 = time.time()
@@ -305,12 +309,25 @@ def main(args):
             f"calib_q {vm.get('calib_q_gap', float('nan')):.4f} | "
             f"gap_frac {vm.get('frac_gap', float('nan')):.4f} | "
             f"r_supervised {vm.get('frac_r_supervised', float('nan')):.4f}"
+            + (f" | var_q_vel {vm['mean_var_q_velocity']:.3e}" if "mean_var_q_velocity" in vm else "")
+            + (f" | innov_kf_gated {vm.get('innov_kf_frac_gated', 0.0):.4f}"
+               if args.innovation_kf_coeff > 0 else "")
         )
         if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
             print("Non-finite loss — stopping."); break
-        scheduler.step(val_loss)
-        if val_loss < best_val:
-            best_val = val_loss; patience = 0
+        # Optional EMA of the validation loss for scheduling and model selection:
+        # a noisy objective otherwise lets one lucky epoch end the run early.
+        if args.val_smoothing > 0:
+            smoothed_val = (val_loss if smoothed_val is None
+                            else args.val_smoothing * smoothed_val + (1 - args.val_smoothing) * val_loss)
+            selection_val = smoothed_val
+            print(f"  smoothed val {smoothed_val:.6f}")
+        else:
+            selection_val = val_loss
+        history.setdefault("selection_val", []).append(selection_val)
+        scheduler.step(selection_val)
+        if selection_val < best_val:
+            best_val = selection_val; patience = 0
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
@@ -428,7 +445,21 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=3e-4)
-    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--patience", type=int, default=10,
+                   help="early-stopping patience (epochs without a better selection loss)")
+    p.add_argument("--lr_patience", type=int, default=None,
+                   help="epochs without improvement before halving the LR (default: patience // 3)")
+    p.add_argument("--val_smoothing", type=float, default=0.0,
+                   help="EMA factor in [0, 1) for the validation loss used by the LR scheduler and "
+                        "model selection (0 = raw loss, thesis behaviour; ~0.5 for noisy objectives)")
+    p.add_argument("--innovation_kf_robust", choices=["none", "huber", "student_t"], default="none",
+                   help="bounded-growth cost for the innovation distance so a few jumps "
+                        "(mismatched detections, re-appearances) cannot dominate the loss")
+    p.add_argument("--innovation_kf_robust_param", type=float, default=None,
+                   help="huber delta (default 3) or student-t degrees of freedom (default 5)")
+    p.add_argument("--innovation_kf_gate", type=float, default=None,
+                   help="squared-distance gate (e.g. 18.47 = chi2 99.9%%, 4 dof): detections beyond it "
+                        "are still scored but do not update the filter state")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gather_workers", type=int, default=0,

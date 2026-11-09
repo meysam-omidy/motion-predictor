@@ -342,10 +342,34 @@ def _init_state_from_history(src, vel_floor, dtype):
     return x, P, steps_since, valid
 
 
+ROBUST_DEFAULTS = {"huber": 3.0, "student_t": 5.0}
+
+
+def robust_mahalanobis(d2, kind="none", param=None):
+    """Bounded-growth replacement for the squared Mahalanobis distance d^2.
+
+    none:       d^2 (Gaussian)
+    huber:      d^2 up to d = delta, then 2*delta*d - delta^2 (linear in d)
+    student_t:  (nu + 4) * log(1 + d^2 / nu), twice the 4-D Student-t NLL term
+                (quadratic for small d^2, logarithmic for large d^2)
+    All keep a positive slope, so an outlier still asks for a larger S, but a
+    single jump can no longer dominate the batch.
+    """
+    if kind == "none":
+        return d2
+    param = ROBUST_DEFAULTS[kind] if param is None else float(param)
+    if kind == "huber":
+        d = torch.sqrt(d2.clamp(min=1e-12))
+        return torch.where(d <= param, d2, 2.0 * param * d - param ** 2)
+    if kind == "student_t":
+        return (param + 4.0) * torch.log1p(d2 / param)
+    raise ValueError(f"unknown robust kind {kind!r}")
+
+
 def innovation_likelihood_kf_loss(
     log_var_q, log_var_r, src, trg,
     var_floor=VAR_FLOOR, vel_floor=1e-8, compute_dtype=torch.float32,
-    burn_in=1,
+    burn_in=1, robust="none", robust_param=None, gate=None, return_stats=False,
 ):
     """Self-supervised Q/R loss: negative log-likelihood of each new DETECTION
     under the Kalman filter's own prediction (paper upgrade U1).
@@ -364,7 +388,13 @@ def innovation_likelihood_kf_loss(
     target steps, whose covariance is dominated by the coarse initialization.
     With a 4-D Q the velocity process noise is the constant ``vel_floor``
     (the tracker's tiny pixel floor is ~1e-8 in normalized units); a 7-D Q learns it.
-    Returns (loss, detached loss, number of scored steps).
+
+    Robustness (a plain Gaussian is dominated by a few jumps, e.g. a detection of a
+    neighbour matched in a crowd): ``robust`` replaces d^2 in the NLL by a bounded-
+    growth cost (see ``robust_mahalanobis``), and ``gate`` (a d^2 threshold such as
+    the chi-square 99.9% value 18.47) keeps an implausible detection out of the
+    filter update while still scoring it.
+    Returns (loss, detached loss, number of scored steps[, stats]).
     """
     B, T, _ = trg.shape
     if T < 1:
@@ -399,6 +429,7 @@ def innovation_likelihood_kf_loss(
 
     observed = trg[..., 14] > 0.5
     seen = torch.zeros(B, dtype=torch.long, device=trg.device)
+    n_gated = torch.zeros((), dtype=torch.long, device=trg.device)
     terms, counts = [], []
     for t in range(T):
         Q = process_noise(t, x)
@@ -417,21 +448,36 @@ def innovation_likelihood_kf_loss(
         ok = obs_t & (info == 0)
         L = torch.where(ok.view(B, 1, 1), L, I4.expand(B, 4, 4))
         solved = torch.cholesky_solve(nu, L)
-        mahalanobis = (nu * solved).sum(dim=(-1, -2))
-        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
-        nll = 0.5 * (mahalanobis.clamp(max=1e6) + logdet + 4 * log_2pi)
+        mahalanobis = (nu * solved).sum(dim=(-1, -2)).clamp(min=0.0, max=1e6)
+        diag_l = torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=1e-30)
+        logdet = 2.0 * torch.log(diag_l).sum(-1)
+        nll = 0.5 * (robust_mahalanobis(mahalanobis, robust, robust_param)
+                     + logdet + 4 * log_2pi)
         scored = ok & (seen >= burn_in)
         terms.append(torch.where(scored, nll, torch.zeros_like(nll)))
         counts.append(scored.to(dtype))
-        # Kalman update on observed steps only (gaps keep the prediction).
+        if gate is not None:
+            # An implausible detection (d^2 beyond the gate) is still scored by
+            # the robust cost, so the model cannot gain by declaring steps
+            # outliers, but it does not corrupt the filter state, like the
+            # tracker's own gate.
+            gated = ok & (mahalanobis.detach() > gate)
+            n_gated = n_gated + (gated & scored).sum()
+            update = ok & ~gated
+        else:
+            update = ok
+        # Kalman update on observed (and accepted) steps only.
         K = P @ Hm.transpose(-1, -2) @ torch.cholesky_inverse(L)
-        x = torch.where(ok.view(B, 1, 1), x + K @ nu, x)
-        P = torch.where(ok.view(B, 1, 1), (I7 - K @ Hm) @ P, P)
+        x = torch.where(update.view(B, 1, 1), x + K @ nu, x)
+        P = torch.where(update.view(B, 1, 1), (I7 - K @ Hm) @ P, P)
         seen = seen + ok.long()
 
     count = torch.stack(counts).sum()
     total = torch.stack(terms).sum() / count.clamp(min=1.0)
     total = total.to(log_var_q.dtype)
+    if return_stats:
+        n = max(int(count.item()), 1)
+        return total, total.detach(), int(count.item()), {"frac_gated": int(n_gated.item()) / n}
     return total, total.detach(), int(count.item())
 
 
@@ -491,6 +537,9 @@ class AdaptiveKalmanLoss(nn.Module):
         innovation_kf_vel_floor: float = 1e-8,
         innovation_kf_burn_in: int = 1,
         innovation_kf_fp32: bool = True,
+        innovation_kf_robust: str = "none",
+        innovation_kf_robust_param: Optional[float] = None,
+        innovation_kf_gate: Optional[float] = None,
     ):
         super().__init__()
         self.innovation_coeff = innovation_coeff
@@ -512,6 +561,11 @@ class AdaptiveKalmanLoss(nn.Module):
         self.innovation_kf_burn_in = innovation_kf_burn_in
         # fp32 is fast on consumer GPUs; fp64 is the slower, more exact fallback.
         self.innovation_kf_dtype = torch.float32 if innovation_kf_fp32 else torch.float64
+        if innovation_kf_robust not in ("none", "huber", "student_t"):
+            raise ValueError(f"unknown innovation_kf_robust {innovation_kf_robust!r}")
+        self.innovation_kf_robust = innovation_kf_robust
+        self.innovation_kf_robust_param = innovation_kf_robust_param
+        self.innovation_kf_gate = innovation_kf_gate
 
     @property
     def uses_ground_truth(self) -> bool:
@@ -628,16 +682,21 @@ class AdaptiveKalmanLoss(nn.Module):
         if self.innovation_kf_coeff > 0:
             if src is None:
                 raise ValueError("innovation_kf_coeff > 0 needs the history window `src`")
-            loss_innov_kf, innov_kf_val, innov_kf_steps = innovation_likelihood_kf_loss(
+            loss_innov_kf, innov_kf_val, innov_kf_steps, innov_kf_stats = innovation_likelihood_kf_loss(
                 log_var_q_full, log_var_r, src, trg,
                 var_floor=self.var_floor, vel_floor=self.innovation_kf_vel_floor,
                 burn_in=self.innovation_kf_burn_in,
                 compute_dtype=self.innovation_kf_dtype,
+                robust=self.innovation_kf_robust,
+                robust_param=self.innovation_kf_robust_param,
+                gate=self.innovation_kf_gate,
+                return_stats=True,
             )
         else:
             loss_innov_kf = innovations.new_tensor(0.0)
             innov_kf_val = innovations.new_tensor(0.0)
             innov_kf_steps = 0
+            innov_kf_stats = {"frac_gated": 0.0}
 
         loss = (
             self.innovation_coeff * loss_innov
@@ -664,6 +723,7 @@ class AdaptiveKalmanLoss(nn.Module):
                 "loss_kf_track": float(kf_track_val),
                 "loss_innov_kf": float(innov_kf_val),
                 "innov_kf_steps": float(innov_kf_steps),
+                "innov_kf_frac_gated": float(innov_kf_stats["frac_gated"]),
                 "mean_var_q": float(var_q.mean()),
                 "mean_var_r": float(var_r.mean()),
                 "mean_innov_sq": float(innov_sq.mean()),
